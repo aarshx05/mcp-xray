@@ -35,8 +35,14 @@ func (s *SecretsScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 	var allFindings []report.Finding
 
 	err = filepath.Walk(s.repoPath, func(filePath string, info os.FileInfo, err error) error {
+		// As in SASTScanner.Scan: an entry that cannot be walked is skipped
+		// with a warning, but an unreadable scan root fails the scan.
 		if err != nil {
-			return err
+			if filePath == s.repoPath {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "reposcan: skipping %s: %v\n", filePath, err)
+			return nil
 		}
 
 		// Check if path should be excluded based on config
@@ -52,6 +58,13 @@ func (s *SecretsScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 			return nil
 		}
 
+		// Skip non-regular files: a symlink (to a directory, or to itself)
+		// cannot be read as a file, and a FIFO would block. A symlinked
+		// file inside the repository is scanned at its real path.
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
 		// Skip files larger than configured max size
 		if info.Size() > s.config.MaxFileSize {
 			return nil
@@ -60,7 +73,8 @@ func (s *SecretsScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 		// Read file content
 		fileContent, err := os.ReadFile(filePath)
 		if err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "reposcan: skipping unreadable %s: %v\n", filePath, err)
+			return nil
 		}
 
 		// Detect unsafe commands in this file
