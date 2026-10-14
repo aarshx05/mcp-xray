@@ -628,9 +628,12 @@ func writeFindings(findings []*proto.Finding, outputPath string, commandName str
 }
 
 func cleanupGeneratedFiles(outputPath string, toolsFilePath string, testFilePath string, testPlanDirPath string) error {
-	// Delete SARIF output file
-	if err := os.Remove(outputPath); err != nil {
-		return fmt.Errorf("error deleting output file %s: %w", outputPath, err)
+	// Delete SARIF output file, if any. Callers leave outputPath empty when the
+	// user chose the output path with -o, which is never auto-deleted.
+	if outputPath != "" {
+		if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("error deleting output file %s: %w", outputPath, err)
+		}
 	}
 
 	// Delete tools file if it exists
