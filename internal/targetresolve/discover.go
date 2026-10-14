@@ -25,40 +25,14 @@ var manifestConstructors = map[string]func(manifestPath string) (*Project, error
 	"Cargo.toml":     newRustProject,
 }
 
-// discoverProjects walks repoRoot looking for ecosystem manifest files and
-// returns one Project per manifest found, with Role left unset (signals.go
-// fills that in as a separate pass, once every project is known -- role
-// classification for shared libraries depends on seeing every project, not
-// just the one being visited).
-//
-// Reuses reposcan's default exclude list (config.go) so dependency caches --
-// node_modules, .venv, vendor, .git, etc. -- are never descended into, the
-// same pruning repo-scan's own SAST/secrets walkers already rely on. A
-// directory can legitimately contain more than one nested project (e.g. a
-// Python tool-definitions package living inside a larger Node monorepo), so
-// finding a manifest does not stop the walk from continuing into
-// subdirectories.
+// discoverProjects returns one Project per ecosystem manifest under
+// repoRoot, with Role left unset: classification needs every project, so it
+// runs as a separate pass. A directory can hold several projects (say, a
+// Python package inside a Node monorepo), so a manifest never stops the walk
+// from descending further. A malformed manifest is skipped, not fatal.
 func discoverProjects(repoRoot string) ([]*Project, error) {
-	prune := &reposcan.Config{
-		Root:          repoRoot,
-		ExcludedPaths: reposcan.DefaultConfig().ExcludedPaths,
-	}
-
 	var projects []*Project
-	err := filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if prune.ShouldExclude(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-
+	err := walkFiles(repoRoot, nil, func(path string, info os.FileInfo) error {
 		constructor, ok := manifestConstructors[info.Name()]
 		if !ok {
 			if !strings.HasSuffix(info.Name(), ".csproj") {
@@ -66,22 +40,39 @@ func discoverProjects(repoRoot string) ([]*Project, error) {
 			}
 			constructor = newDotnetProject
 		}
-
 		project, err := constructor(path)
-		if err != nil {
-			// A malformed manifest should not abort discovery of the rest of
-			// the repository -- skip it, the same tolerance repo-scan's own
-			// scanners already apply to unreadable/unparseable files.
+		if err != nil || project == nil {
 			return nil
 		}
-		if project != nil {
-			projects = append(projects, project)
-		}
+		project.RelDir = repoRelative(repoRoot, project.Dir)
+		projects = append(projects, project)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	return projects, nil
+}
+
+// walkFiles calls visit for every file under root, skipping the directories
+// the scanners skip by default (reposcan.DefaultExcludedDirs) and any
+// directory skipDir reports (nil skips none). Unreadable entries are
+// skipped rather than aborting the walk; visit may return filepath.SkipAll
+// to stop early.
+func walkFiles(root string, skipDir func(dir string) bool, visit func(path string, info os.FileInfo) error) error {
+	prune := &reposcan.Config{Root: root, ExcludedPaths: reposcan.DefaultExcludedDirs()}
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		switch {
+		case err != nil:
+			return nil
+		case info.IsDir():
+			if prune.ShouldExclude(path) || (skipDir != nil && skipDir(path)) {
+				return filepath.SkipDir
+			}
+			return nil
+		case prune.ShouldExclude(path):
+			return nil
+		}
+		return visit(path, info)
+	})
 }

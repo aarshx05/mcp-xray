@@ -11,6 +11,8 @@
 // to the resolution algorithm itself.
 package targetresolve
 
+import "path/filepath"
+
 // Role classifies what a discovered project actually is with respect to MCP.
 type Role string
 
@@ -31,8 +33,7 @@ const (
 
 	// RoleConsumerConfigOnly is a project that merely configures/references
 	// external MCP servers (an mcp.json-style config block) without any MCP
-	// SDK dependency of its own. This must never be classified as a server --
-	// it is the direct fix for the "MCP consumer false positive" pattern.
+	// SDK dependency of its own. Such a project is never a server.
 	RoleConsumerConfigOnly Role = "mcp-consumer-config-only"
 
 	// RoleUnrelated is everything else: no MCP signal, not referenced by any
@@ -68,14 +69,25 @@ type Project struct {
 	// ManifestPath).
 	Dir string
 
+	// RelDir is Dir relative to the repository root, in POSIX form ("." for
+	// the root itself), set when the project is discovered. Path-shape
+	// heuristics (isTestShapedProject) use it instead of Dir so that the
+	// directories ABOVE the checkout -- say a CI workspace under
+	// /builds/tests/ -- can never change how a project inside it is
+	// classified.
+	RelDir string
+
 	// OwnershipRoot is the physical component boundary used for scanning. It
-	// may be above Dir when a registry/component boundary owns sibling source,
-	// tests, documentation, or deployment content.
+	// is Dir unless an ancestor directory holds a registry server.json, in
+	// which case that ancestor owns the sibling source, tests, documentation
+	// and deployment content too. Read it through ScanRoot.
 	OwnershipRoot string
 
-	// OwnershipEvidence explains why OwnershipRoot was selected. An empty
-	// list means the conservative project-directory boundary was used.
-	OwnershipEvidence  []string
+	// OwnershipEvidence explains why OwnershipRoot was selected.
+	OwnershipEvidence []string
+
+	// OwnershipAmbiguous is set when projects in different directories share
+	// one OwnershipRoot, so their files cannot be told apart by path.
 	OwnershipAmbiguous bool
 
 	// Ecosystem identifies which manifest family this project was
@@ -138,14 +150,15 @@ type Project struct {
 	// launchable entrypoint, not just a downstream dependency) and surfaced
 	// by cmd/xray/target_cli.go for display.
 	BinNames []string
+}
 
-	// WorkspaceSources records which higher-level workspace-management
-	// tool(s) (rush/lerna/nx/turborepo/pnpm-workspace) recognize this
-	// project as a member -- see workspace_registry.go. Stored in its own
-	// field rather than appended to Evidence because classifyRoles
-	// REPLACES (not appends to) Evidence, and this needs to survive that
-	// assignment regardless of pipeline ordering.
-	WorkspaceSources []string
+// ScanRoot is the directory scanned for this project: its OwnershipRoot,
+// or Dir before identities have been assigned.
+func (p *Project) ScanRoot() string {
+	if p.OwnershipRoot != "" {
+		return filepath.Clean(p.OwnershipRoot)
+	}
+	return filepath.Clean(p.Dir)
 }
 
 // InclusionReason explains why a project appears in a Target's Included set.
@@ -169,6 +182,21 @@ const (
 	InclusionTestDependent InclusionReason = "test-dependent"
 )
 
+// rank orders inclusion reasons so that, when two targets merge, a project
+// keeps the strongest reason it was included for.
+func (r InclusionReason) rank() int {
+	switch r {
+	case InclusionPrimary:
+		return 3
+	case InclusionSharedDependency:
+		return 2
+	case InclusionTestDependent:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // Target is one selectable MCP server: its own project plus every project
 // reachable from it via workspace-local dependencies (the shared components
 // that must be included for an accurate scan).
@@ -190,8 +218,8 @@ type Target struct {
 	Included []*Project
 
 	// IncludedReasons explains why each entry in Included is there, keyed by
-	// filepath.Clean(Project.Dir). Purely additive diagnostic metadata --
-	// never consulted by ScanRoots or any scanning logic itself.
+	// filepath.Clean(Project.Dir). The planner derives each scan unit's
+	// per-target Relation from it; ScanRoots ignores it.
 	IncludedReasons map[string]InclusionReason
 
 	// IncludedProjectIDs is the stable-ID form of Included.
@@ -217,10 +245,10 @@ type Component struct {
 // identical component IDs, target IDs, relation and context — regardless of
 // which scan unit produced the finding.
 type FileOwnership struct {
-	ComponentIDs []string `json:"componentIds,omitempty"`
-	TargetIDs    []string `json:"targetIds,omitempty"`
-	Relation     string   `json:"relation"`
-	Context      string   `json:"context"`
+	ComponentIDs []string
+	TargetIDs    []string
+	Relation     Relation
+	Context      string
 }
 
 // TargetSummary is a per-target diagnostic record included in SARIF
@@ -245,7 +273,6 @@ type InventoryEntry struct {
 	ComponentIDs []string `json:"componentIds,omitempty"`
 	Manifest     bool     `json:"manifest,omitempty"`
 	Lockfile     bool     `json:"lockfile,omitempty"`
-	Excluded     bool     `json:"excluded,omitempty"`
 	Ownership    string   `json:"ownership,omitempty"`
 }
 

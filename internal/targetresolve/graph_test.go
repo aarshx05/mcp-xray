@@ -196,7 +196,7 @@ func TestDemoteReachableFallbackServers_ImmuneWithOwnBinEntry(t *testing.T) {
 
 func TestIncludeTestDependents_PullsInReverseDependentTestProject(t *testing.T) {
 	primary := &Project{Name: "server", Dir: "/repo/src/server"}
-	testProj := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests"}
+	testProj := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", RelDir: "tests/server.tests"}
 	testProj.LocalDeps = []string{primary.Dir}
 
 	byDir := map[string]*Project{
@@ -242,7 +242,7 @@ func TestIncludeTestDependents_UnrelatedServersOwnTestsDoNotLeakViaSharedDep(t *
 	serverB := &Project{Name: "server-b", Dir: "/repo/server-b"}
 	serverA.LocalDeps = []string{shared.Dir}
 	serverB.LocalDeps = []string{shared.Dir}
-	serverBTests := &Project{Name: "server-b-tests", Dir: "/repo/tests/server-b"}
+	serverBTests := &Project{Name: "server-b-tests", Dir: "/repo/tests/server-b", RelDir: "tests/server-b"}
 	serverBTests.LocalDeps = []string{serverB.Dir}
 
 	byDir := map[string]*Project{
@@ -263,7 +263,7 @@ func TestBuildTargets_IncludesTestDependentAndTagsReason(t *testing.T) {
 	server := &Project{Name: "server", Dir: "/repo/src/server", Role: RoleMCPServer}
 	shared := &Project{Name: "shared", Dir: "/repo/shared", Role: RoleUnrelated}
 	server.LocalDeps = []string{shared.Dir}
-	tests := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", Role: RoleMCPClient}
+	tests := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", RelDir: "tests/server.tests", Role: RoleMCPClient}
 	tests.LocalDeps = []string{server.Dir}
 
 	targets := buildTargets([]*Project{server, shared, tests})
@@ -305,7 +305,7 @@ func TestBuildTargets_TestDependentClosureDoesNotDuplicateAlreadyIncludedSharedD
 	server := &Project{Name: "server", Dir: "/repo/server", Role: RoleMCPServer}
 	shared := &Project{Name: "shared", Dir: "/repo/shared", Role: RoleUnrelated}
 	server.LocalDeps = []string{shared.Dir}
-	tests := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", Role: RoleMCPClient}
+	tests := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", RelDir: "tests/server.tests", Role: RoleMCPClient}
 	tests.LocalDeps = []string{server.Dir, shared.Dir}
 
 	targets := buildTargets([]*Project{server, shared, tests})

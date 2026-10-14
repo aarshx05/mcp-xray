@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"time"
 
 	"mcpxray/proto"
 )
 
+// ScannerStatus is the outcome of one scanner execution.
 type ScannerStatus string
 
 const (
@@ -17,9 +17,10 @@ const (
 	ScannerFailed      ScannerStatus = "failed"
 	ScannerSkipped     ScannerStatus = "skipped"
 	ScannerUnsupported ScannerStatus = "unsupported"
-	ScannerPartial     ScannerStatus = "partial"
 )
 
+// ScannerExecution records one scanner run over one scan unit. A failed run
+// is never reported as zero findings.
 type ScannerExecution struct {
 	ID           string        `json:"id"`
 	ScanUnitID   string        `json:"scanUnitId"`
@@ -31,11 +32,20 @@ type ScannerExecution struct {
 	Error        string        `json:"error,omitempty"`
 }
 
-type DetailedScanResult struct {
-	Findings   []*proto.Finding   `json:"-"`
-	Executions []ScannerExecution `json:"executions"`
+// ExecutedFinding is a raw scanner finding together with the execution that
+// produced it.
+type ExecutedFinding struct {
+	Finding     *proto.Finding
+	ExecutionID string
 }
 
+// DetailedScanResult is every finding and execution of one ScanDetailed call.
+type DetailedScanResult struct {
+	Findings   []ExecutedFinding
+	Executions []ScannerExecution
+}
+
+// ScannerSelection names the scanners to run.
 type ScannerSelection struct{ SCA, Secrets, SAST bool }
 
 func executionID(scanUnitID, scanner string) string {
@@ -43,42 +53,44 @@ func executionID(scanUnitID, scanner string) string {
 	return "exec-" + hex.EncodeToString(sum[:8])
 }
 
-// ScanDetailed runs the same scanner entry points as the legacy path while
-// retaining execution state. A failed scanner is never reported as zero
-// findings, and successful raw findings are returned unchanged.
+// ScanDetailed runs the selected scanners over one scan unit, recording an
+// execution per scanner (skipped ones included) and each finding's
+// execution. Successful raw findings are returned unchanged.
 func ScanDetailed(ctx context.Context, root string, config *Config, selection ScannerSelection, scanUnitID string, inputSummary string) DetailedScanResult {
-	result := DetailedScanResult{}
-	run := func(name string, enabled bool, scan func() ([]*proto.Finding, error)) {
-		execID := executionID(scanUnitID, name)
-		if !enabled {
-			result.Executions = append(result.Executions, ScannerExecution{ID: execID, ScanUnitID: scanUnitID, Scanner: name, Status: ScannerSkipped, InputSummary: inputSummary})
-			return
-		}
-		start := time.Now()
-		findings, err := scan()
-		durationMs := time.Since(start).Milliseconds()
-		if err != nil {
-			if IsUnsupportedScanError(err) {
-				result.Executions = append(result.Executions, ScannerExecution{ID: execID, ScanUnitID: scanUnitID, Scanner: name, Status: ScannerUnsupported, InputSummary: inputSummary, DurationMs: durationMs, Error: err.Error()})
-				return
-			}
-			result.Executions = append(result.Executions, ScannerExecution{ID: execID, ScanUnitID: scanUnitID, Scanner: name, Status: ScannerFailed, InputSummary: inputSummary, DurationMs: durationMs, Error: err.Error()})
-			return
-		}
-		result.Findings = append(result.Findings, findings...)
-		result.Executions = append(result.Executions, ScannerExecution{ID: execID, ScanUnitID: scanUnitID, Scanner: name, Status: ScannerSuccess, InputSummary: inputSummary, DurationMs: durationMs, FindingCount: len(findings)})
-	}
-	run("osv", selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).Scan(ctx) })
-	run("gitleaks", selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
-	run("sast", selection.SAST, func() ([]*proto.Finding, error) { return NewSASTScanner(root, config).Scan(ctx) })
+	var result DetailedScanResult
+	result.run(scanUnitID, "osv", inputSummary, selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).Scan(ctx) })
+	result.run(scanUnitID, "gitleaks", inputSummary, selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
+	result.run(scanUnitID, "sast", inputSummary, selection.SAST, func() ([]*proto.Finding, error) { return NewSASTScanner(root, config).Scan(ctx) })
 	return result
 }
 
-func (r DetailedScanResult) Err() error {
-	for _, execution := range r.Executions {
-		if execution.Status == ScannerFailed {
-			return fmt.Errorf("%s scanner failed: %s", execution.Scanner, execution.Error)
+// ScanRootOwnFilesDetailed is ScanRootOwnFiles recorded as one osv
+// execution of scanUnitID.
+func ScanRootOwnFilesDetailed(root, scanUnitID, inputSummary string) DetailedScanResult {
+	var result DetailedScanResult
+	result.run(scanUnitID, "osv", inputSummary, true, func() ([]*proto.Finding, error) { return ScanRootOwnFiles(root) })
+	return result
+}
+
+// run executes one scanner when enabled and records its execution, and the
+// execution of each finding it reports.
+func (r *DetailedScanResult) run(scanUnitID, scanner, inputSummary string, enabled bool, scan func() ([]*proto.Finding, error)) {
+	execution := ScannerExecution{ID: executionID(scanUnitID, scanner), ScanUnitID: scanUnitID, Scanner: scanner, Status: ScannerSkipped, InputSummary: inputSummary}
+	if enabled {
+		start := time.Now()
+		findings, err := scan()
+		execution.DurationMs = time.Since(start).Milliseconds()
+		switch {
+		case IsUnsupportedScanError(err):
+			execution.Status, execution.Error = ScannerUnsupported, err.Error()
+		case err != nil:
+			execution.Status, execution.Error = ScannerFailed, err.Error()
+		default:
+			execution.Status, execution.FindingCount = ScannerSuccess, len(findings)
+			for _, finding := range findings {
+				r.Findings = append(r.Findings, ExecutedFinding{Finding: finding, ExecutionID: execution.ID})
+			}
 		}
 	}
-	return nil
+	r.Executions = append(r.Executions, execution)
 }

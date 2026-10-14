@@ -1,6 +1,10 @@
 package targetresolve
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestPromoteWrapperServers_PromotesWrapperReachingAConfirmedServer(t *testing.T) {
 	server := &Project{Name: "real-server", Dir: "/repo/real-server", Ecosystem: "node", Role: RoleMCPServer}
@@ -48,12 +52,51 @@ func TestPromoteWrapperServers_MultiHopFixedPoint(t *testing.T) {
 
 func TestPromoteWrapperServers_TestShapedProjectNeverPromoted(t *testing.T) {
 	server := &Project{Name: "real-server", Dir: "/repo/real-server", Ecosystem: "node", Role: RoleMCPServer}
-	testProj := &Project{Name: "server.Tests", Dir: "/repo/server.Tests", Ecosystem: "node", Role: RoleUnrelated, BinNames: []string{"test-runner"}}
+	testProj := &Project{Name: "server.Tests", Dir: "/repo/server.Tests", RelDir: "server.Tests", Ecosystem: "node", Role: RoleUnrelated, BinNames: []string{"test-runner"}}
 	testProj.LocalDeps = []string{server.Dir}
 
 	promoteWrapperServers([]*Project{server, testProj})
 
 	if testProj.Role == RoleMCPServer {
 		t.Errorf("expected a test-shaped project to never be promoted to RoleMCPServer, got %v", testProj.Role)
+	}
+}
+
+// Wrapper promotion names the server its dependency closure reaches. With
+// several reachable servers, the name must not depend on Go's randomized map
+// iteration order: --list-targets output (including --json) has to be
+// identical from run to run.
+func TestPromoteWrapperServers_EvidenceIsDeterministic(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{
+		"name": "wrapper",
+		"bin": "./cli.js",
+		"dependencies": {"server-c": "workspace:*", "server-a": "workspace:*", "server-d": "workspace:*", "server-b": "workspace:*"}
+	}`)
+	for _, name := range []string{"server-a", "server-b", "server-c", "server-d"} {
+		writeFile(t, filepath.Join(root, "servers", name, "package.json"), `{"name": "`+name+`", "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+		writeFile(t, filepath.Join(root, "servers", name, "index.js"), `const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js"); new McpServer();`)
+	}
+
+	var first string
+	for run := 0; run < 20; run++ {
+		resolution, err := Resolve(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var evidence string
+		for _, p := range resolution.Projects {
+			if p.Name == "wrapper" {
+				evidence = strings.Join(p.Evidence, "; ")
+			}
+		}
+		if run == 0 {
+			first = evidence
+			if !strings.Contains(first, "wrapper/composed MCP server") {
+				t.Fatalf("wrapper was not promoted; evidence = %q", first)
+			}
+		} else if evidence != first {
+			t.Fatalf("run %d evidence differs:\n  %q\nvs\n  %q", run, evidence, first)
+		}
 	}
 }

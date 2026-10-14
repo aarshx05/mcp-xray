@@ -6,6 +6,46 @@ import (
 	"testing"
 )
 
+// TestResolve_CheckoutUnderTestsAncestorStillFindsServers reproduces a
+// checkout that happens to live under a directory named "tests" (a CI
+// workspace, a fixtures checkout): the ancestor is outside the repository, so
+// it must not make the repository's server look like a test harness.
+func TestResolve_CheckoutUnderTestsAncestorStillFindsServers(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tests", "checkout")
+	writeFile(t, filepath.Join(root, "server", "go.mod"), `module example.com/server
+
+go 1.22
+
+require github.com/modelcontextprotocol/go-sdk v1.3.1
+`)
+	writeFile(t, filepath.Join(root, "server", "main.go"), `package main
+import "github.com/modelcontextprotocol/go-sdk/mcp"
+func main() { _ = mcp.NewServer(nil, nil) }
+`)
+	writeFile(t, filepath.Join(root, "server", "tests", "harness", "go.mod"), `module example.com/harness
+
+go 1.22
+
+require github.com/modelcontextprotocol/go-sdk v1.3.1
+`)
+	writeFile(t, filepath.Join(root, "server", "tests", "harness", "main.go"), `package main
+import "github.com/modelcontextprotocol/go-sdk/mcp"
+func main() { _ = mcp.NewServer(nil, nil) }
+`)
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if len(resolution.Targets) != 1 || resolution.Targets[0].Name != "server" {
+		var names []string
+		for _, target := range resolution.Targets {
+			names = append(names, target.Name)
+		}
+		t.Fatalf("targets = %v, want only server (the in-repo tests/ harness stays test-shaped)", names)
+	}
+}
+
 // TestResolve_IndependentServerCollection builds a minimal pattern-1 fixture
 // on disk (two independent Go MCP servers, one shared Go library referenced
 // by only one of them) and checks Resolve() end-to-end: two targets with

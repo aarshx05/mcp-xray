@@ -3,6 +3,7 @@ package targetresolve
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -114,12 +115,13 @@ func lastPathSegment(modPath string) string {
 	return modPath[idx+1:]
 }
 
-// addLocalDep appends dir to p.LocalDeps if it is not already present.
+// addLocalDep records dir as a workspace-local dependency of p, keeping
+// LocalDeps sorted and free of duplicates. The ecosystem adapters discover
+// dependencies by ranging over manifest maps, whose order Go randomizes;
+// sorting here keeps everything that walks LocalDeps (transitiveClosure, the
+// evidence wrapper promotion records) identical from run to run.
 func addLocalDep(p *Project, dir string) {
-	for _, existing := range p.LocalDeps {
-		if existing == dir {
-			return
-		}
+	if i, found := slices.BinarySearch(p.LocalDeps, dir); !found {
+		p.LocalDeps = slices.Insert(p.LocalDeps, i, dir)
 	}
-	p.LocalDeps = append(p.LocalDeps, dir)
 }

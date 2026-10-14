@@ -1,55 +1,90 @@
 package targetresolve
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"mcpxray/internal/aggregation"
 )
+
+// Relation is how a scan unit or a file relates to a selected target.
+type Relation string
 
 const (
-	RelationDirect           = "direct"
-	RelationShared           = "shared"
-	RelationCompanion        = "companion"
-	RelationRepositoryGlobal = "repository-global"
-
-	// RelationWorkspaceRoot marks a finding that came from a workspace-level
-	// dependency file at the repository root (e.g. a shared package-lock.json
-	// backing several npm/yarn/pnpm workspace members) rather than from the
-	// target's own directory. See ScanUnit.FallbackLockfiles.
-	RelationWorkspaceRoot = "workspace-root-dependency"
+	// RelationDirect: the target's own project (for a unit), or a file only
+	// one selected target uses (for a file).
+	RelationDirect Relation = "direct"
+	// RelationShared: a dependency of the target (for a unit), or a file
+	// several selected targets use (for a file).
+	RelationShared Relation = "shared"
+	// RelationCompanion: a test project that depends on the target.
+	RelationCompanion Relation = "companion"
+	// RelationRepositoryGlobal: repository content no selected target owns.
+	RelationRepositoryGlobal Relation = "repository-global"
+	// RelationWorkspaceRoot: a repository-root lockfile scanned on a target's
+	// behalf (see ScanUnit.FallbackLockfiles).
+	RelationWorkspaceRoot Relation = "workspace-root-dependency"
 )
 
-// ScanUnit is one physical scanner invocation. A unit may be attributed to
-// several targets, but its root/configuration is executed only once.
-type ScanUnit struct {
-	ID           string            `json:"id"`
-	Root         string            `json:"-"`
-	RelativeRoot string            `json:"root"`
-	TargetIDs    []string          `json:"targetIds,omitempty"`
-	Relations    map[string]string `json:"relations,omitempty"`
-	ExcludedDirs []string          `json:"excludedDirs,omitempty"`
-	Files        []string          `json:"files,omitempty"`
-	Manifests    []string          `json:"manifests,omitempty"`
-	Lockfiles    []string          `json:"lockfiles,omitempty"`
-
-	// FallbackLockfiles is the set of repo-root-level lockfile paths (repo-
-	// relative POSIX, always a file directly in the repository root) that
-	// dependency scanning should additionally check on this unit's behalf,
-	// because the unit's own scope -- respecting its own exclusions -- has no
-	// lockfile of its own for an ecosystem it actually uses. This is the
-	// shared-workspace-lockfile pattern: an npm/yarn/pnpm or Cargo workspace
-	// member's own package.json/Cargo.toml declares dependencies, but only
-	// the workspace root's own lockfile pins their exact resolved versions,
-	// so a scan scoped to just the member's own directory has nothing to
-	// resolve exact versions from. Always empty for the repository-global
-	// unit itself (it already covers the repo root directly) and for any
-	// unit whose own scope already has a matching lockfile.
-	FallbackLockfiles []string `json:"fallbackLockfiles,omitempty"`
+// rank orders relations by how closely they tie content to a target, so the
+// strongest wins when several apply.
+func (r Relation) rank() int {
+	switch r {
+	case RelationDirect:
+		return 4
+	case RelationCompanion:
+		return 3
+	case RelationShared:
+		return 2
+	case RelationRepositoryGlobal:
+		return 1
+	}
+	return 0
 }
 
+// ScanUnit is one physical scanner invocation. A unit may serve several
+// targets, but its root is scanned only once.
+type ScanUnit struct {
+	ID           string              `json:"id"`
+	Root         string              `json:"-"`
+	RelativeRoot string              `json:"root"`
+	TargetIDs    []string            `json:"targetIds,omitempty"`
+	Relations    map[string]Relation `json:"relations,omitempty"`
+	ExcludedDirs []string            `json:"excludedDirs,omitempty"`
+	Files        []string            `json:"files,omitempty"`
+	Manifests    []string            `json:"manifests,omitempty"`
+	Lockfiles    []string            `json:"lockfiles,omitempty"`
+
+	// FallbackLockfiles maps each repository-root lockfile that dependency
+	// scanning must also read on this unit's behalf to the IDs of the
+	// targets relying on it. It is the shared-workspace-lockfile pattern: a
+	// workspace member declares its dependencies in its own manifest, but
+	// only the workspace root's lockfile pins their versions. Empty for a
+	// unit rooted at the repository root, which scans those files itself.
+	FallbackLockfiles map[string][]string `json:"fallbackLockfiles,omitempty"`
+}
+
+// ScansDependencies reports whether dependency (SCA) scanning runs on the
+// unit. A unit rooted at the repository root scans dependencies only when a
+// selected target's own project lives there; otherwise the root's
+// dependency files belong to no selected target.
+func (u *ScanUnit) ScansDependencies(repoRoot string) bool {
+	if filepath.Clean(u.Root) != filepath.Clean(repoRoot) {
+		return true
+	}
+	for _, relation := range u.Relations {
+		if relation == RelationDirect {
+			return true
+		}
+	}
+	return false
+}
+
+// PlanOptions selects the targets to plan and the paths to keep out of
+// every scan.
 type PlanOptions struct {
 	TargetIDs         []string
 	AllTargets        bool
@@ -58,25 +93,29 @@ type PlanOptions struct {
 	OutputDirs        []string
 }
 
+// ScanPlan is the set of scan units that together cover the selected
+// targets, and the ownership of every inventoried file.
 type ScanPlan struct {
-	RepoRoot           string                    `json:"-"`
-	RelativeRepoRoot   string                    `json:"repoRoot"`
-	SelectedTargets    []*Target                 `json:"selectedTargets"`
-	Units              []*ScanUnit               `json:"scanUnits"`
-	Inventory          []InventoryEntry          `json:"inventory"`
-	Excluded           []string                  `json:"excluded,omitempty"`
-	Unowned            []string                  `json:"unowned,omitempty"`
-	Ambiguous          []string                  `json:"ambiguous,omitempty"`
-	ComponentRelations map[string]string         `json:"-"`
-	FileOwnership      map[string]*FileOwnership `json:"-"`
+	RepoRoot        string
+	SelectedTargets []*Target
+	Units           []*ScanUnit
+	Inventory       []InventoryEntry
+	Excluded        []string
+	Unowned         []string
+	Ambiguous       []string
+	FileOwnership   map[string]*FileOwnership
 }
 
+// TargetPlanView is a selected target as shown in ScanPlanView.
 type TargetPlanView struct {
 	ID                 string   `json:"id"`
 	Name               string   `json:"name"`
 	ComponentID        string   `json:"componentId"`
 	IncludedProjectIDs []string `json:"includedProjectIds"`
 }
+
+// ScanPlanView is the machine-readable form of a ScanPlan, with
+// repository-relative paths.
 type ScanPlanView struct {
 	RepoRoot        string           `json:"repoRoot"`
 	SelectedTargets []TargetPlanView `json:"selectedTargets"`
@@ -87,6 +126,7 @@ type ScanPlanView struct {
 	Ambiguous       []string         `json:"ambiguous,omitempty"`
 }
 
+// StructuredScanPlan returns the machine-readable view of plan.
 func StructuredScanPlan(plan *ScanPlan) ScanPlanView {
 	view := ScanPlanView{RepoRoot: ".", Units: plan.Units, Inventory: plan.Inventory, Excluded: plan.Excluded, Unowned: plan.Unowned, Ambiguous: plan.Ambiguous}
 	for _, target := range plan.SelectedTargets {
@@ -95,46 +135,31 @@ func StructuredScanPlan(plan *ScanPlan) ScanPlanView {
 	return view
 }
 
-func ScanPlanJSON(plan *ScanPlan) ([]byte, error) {
-	return json.MarshalIndent(StructuredScanPlan(plan), "", "  ")
-}
-
-// BuildInventory provides one deterministic view of repository files for
-// scope diagnostics. Its exclusions are intentionally separate from scanner
-// exclusions: generated MCP X-Ray outputs are not inventory inputs.
-func BuildInventory(repoRoot string, outputPath string, outputDirs []string) ([]InventoryEntry, []string, error) {
-	root, err := filepath.Abs(repoRoot)
-	if err != nil {
-		return nil, nil, err
-	}
-	outputFiles := generatedOutputSet(root, outputPath, outputDirs)
+// buildInventory lists every file under repoRoot the scanners would see,
+// flags dependency manifests and lockfiles, and records which projects'
+// (and components') scan roots contain each file. MCP X-Ray's own generated
+// reports are returned separately as excluded.
+func buildInventory(repoRoot string, projects []*Project) ([]InventoryEntry, []string, error) {
 	var inventory []InventoryEntry
 	var excluded []string
-	prune := &reposcanConfigAdapter{root: root}
-	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if prune.excludeDir(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() {
-			return nil
-		}
-		rel := repoRelative(root, path)
-		if outputFiles[filepath.Clean(path)] || isGeneratedOutputPath(path) {
+	err := walkFiles(repoRoot, nil, func(path string, info os.FileInfo) error {
+		rel := repoRelative(repoRoot, path)
+		if isGeneratedOutputPath(path) {
 			excluded = append(excluded, rel)
 			return nil
 		}
-		entry := InventoryEntry{Path: rel, Manifest: matchesManifest(filepath.Base(path)), Lockfile: matchesLockfile(filepath.Base(path))}
+		entry := InventoryEntry{Path: rel, Manifest: matchesManifest(info.Name()), Lockfile: matchesLockfile(info.Name()), Ownership: "unowned"}
+		for _, p := range projects {
+			if root := p.ScanRoot(); within(path, root) {
+				entry.ProjectIDs = append(entry.ProjectIDs, p.ID)
+				entry.ComponentIDs = append(entry.ComponentIDs, p.ComponentID)
+				if entry.Ownership == "unowned" {
+					entry.Ownership = repoRelative(repoRoot, root)
+				}
+			}
+		}
 		entry.ProjectIDs = uniqueSorted(entry.ProjectIDs)
 		entry.ComponentIDs = uniqueSorted(entry.ComponentIDs)
-		if entry.Ownership == "" {
-			entry.Ownership = "unowned"
-		}
 		inventory = append(inventory, entry)
 		return nil
 	})
@@ -146,45 +171,7 @@ func BuildInventory(repoRoot string, outputPath string, outputDirs []string) ([]
 	return inventory, excluded, nil
 }
 
-// reposcanConfigAdapter avoids importing the scanner package into the public
-// inventory model while retaining the same default directory visibility.
-type reposcanConfigAdapter struct{ root string }
-
-func (c *reposcanConfigAdapter) excludeDir(path string) bool {
-	if filepath.Clean(path) == filepath.Clean(c.root) {
-		return false
-	}
-	part := filepath.Base(path)
-	for _, value := range []string{".git", ".svn", ".hg", ".bzr", "node_modules", ".venv", "venv", "vendor", "__pycache__", ".pytest_cache", ".idea", ".vscode", ".vs", ".gradle", ".mvn", ".next", ".nuxt", ".turbo", ".yarn", "coverage", ".coverage", ".nyc_output", "build", "dist", "out", "tmp", "temp", "cache"} {
-		if part == value {
-			return true
-		}
-	}
-	return false
-}
-
-func generatedOutputSet(repoRoot, outputPath string, outputDirs []string) map[string]bool {
-	set := make(map[string]bool)
-	if outputPath != "" {
-		if abs, err := filepath.Abs(outputPath); err == nil {
-			set[filepath.Clean(abs)] = true
-		}
-	}
-	for _, dir := range outputDirs {
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			continue
-		}
-		filepath.Walk(abs, func(path string, info os.FileInfo, err error) error {
-			if err == nil {
-				set[filepath.Clean(path)] = true
-			}
-			return nil
-		})
-	}
-	return set
-}
-
+// isGeneratedOutputPath reports whether path is a report MCP X-Ray writes.
 func isGeneratedOutputPath(path string) bool {
 	name := strings.ToLower(filepath.Base(path))
 	for _, prefix := range []string{"findings-", "findings_", "merged-", "merged_", "tools_summary_", "merged_test_plan"} {
@@ -195,243 +182,195 @@ func isGeneratedOutputPath(path string) bool {
 	return strings.HasSuffix(name, ".sarif.json") && (strings.Contains(name, "mcpxray") || strings.Contains(name, "repo-scan"))
 }
 
-func matchesManifest(name string) bool {
-	for _, value := range []string{"go.mod", "package.json", "pyproject.toml", "setup.py", "pom.xml", "Cargo.toml"} {
-		if name == value {
-			return true
-		}
-	}
-	return strings.HasSuffix(name, ".csproj")
-}
-func matchesLockfile(name string) bool {
-	for _, value := range []string{"go.sum", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "Pipfile.lock", "uv.lock", "gradle.lockfile", "Cargo.lock", "packages.lock.json"} {
-		if name == value {
-			return true
-		}
-	}
-	return strings.HasSuffix(name, "requirements.txt")
-}
-
-// lockfileEcosystem returns which Project.Ecosystem value a lockfile
-// basename belongs to, mirroring matchesLockfile's own list so the two never
-// drift apart. Returns "" for a name matchesLockfile wouldn't recognize as a
-// lockfile at all.
-func lockfileEcosystem(name string) string {
-	switch name {
-	case "go.sum":
-		return "go"
-	case "package-lock.json", "yarn.lock", "pnpm-lock.yaml":
-		return "node"
-	case "poetry.lock", "Pipfile.lock", "uv.lock":
-		return "python"
-	case "gradle.lockfile":
-		return "java"
-	case "Cargo.lock":
-		return "rust"
-	case "packages.lock.json":
-		return "dotnet"
-	}
-	if strings.HasSuffix(name, "requirements.txt") {
-		return "python"
-	}
-	return ""
-}
-
-// BuildInventoryForResolution enriches the deterministic inventory with the
-// projects/components whose ownership roots contain each file.
-func BuildInventoryForResolution(repoRoot string, projects []*Project, outputPath string, outputDirs []string) ([]InventoryEntry, []string, error) {
-	entries, excluded, err := BuildInventory(repoRoot, outputPath, outputDirs)
-	if err != nil {
-		return nil, nil, err
-	}
-	for i := range entries {
-		abs := filepath.Join(repoRoot, filepath.FromSlash(entries[i].Path))
-		for _, p := range projects {
-			root := p.OwnershipRoot
-			if root == "" {
-				root = p.Dir
-			}
-			if within(abs, root) {
-				entries[i].ProjectIDs = append(entries[i].ProjectIDs, p.ID)
-				entries[i].ComponentIDs = append(entries[i].ComponentIDs, p.ComponentID)
-				if entries[i].Ownership == "" || entries[i].Ownership == "unowned" {
-					entries[i].Ownership = repoRelative(repoRoot, root)
-				}
-			}
-		}
-		entries[i].ProjectIDs = uniqueSorted(entries[i].ProjectIDs)
-		entries[i].ComponentIDs = uniqueSorted(entries[i].ComponentIDs)
-		if len(entries[i].ProjectIDs) == 0 {
-			entries[i].Ownership = "unowned"
-		}
-	}
-	return entries, excluded, nil
-}
-
 func within(path, root string) bool {
 	path, root = filepath.Clean(path), filepath.Clean(root)
 	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
-// BuildScanPlan creates one unit per physical ownership root and optionally
-// one residual repository-global unit. Target selection is by stable ID;
-// names are handled by the CLI compatibility layer before this function.
+// BuildScanPlan creates one scan unit per scan root of the selected targets
+// (nested roots folded into the root enclosing them), plus the residual
+// repository-global unit when requested, and records which targets own
+// every inventoried file.
 func BuildScanPlan(resolution *Resolution, options PlanOptions) (*ScanPlan, error) {
 	if resolution == nil {
 		return nil, fmt.Errorf("resolution is nil")
 	}
-	selected := make([]*Target, 0)
-	requested := make(map[string]bool)
-	for _, id := range options.TargetIDs {
-		requested[id] = true
-	}
-	for _, target := range resolution.Targets {
-		if options.AllTargets || requested[target.ID] {
-			selected = append(selected, target)
-		}
-	}
-	if len(options.TargetIDs) > 0 && len(selected) != len(requested) {
-		return nil, fmt.Errorf("one or more target IDs were not discovered")
-	}
-	if len(selected) == 0 && !options.AllTargets {
-		return nil, fmt.Errorf("no targets selected")
+	selected, err := selectTargets(resolution.Targets, options)
+	if err != nil {
+		return nil, err
 	}
 
-	plan := &ScanPlan{RepoRoot: resolution.RepoRoot, RelativeRepoRoot: ".", SelectedTargets: selected, Inventory: resolution.Inventory}
-	units := make(map[string]*ScanUnit)
-	for _, target := range selected {
-		for _, project := range target.Included {
-			root := project.OwnershipRoot
-			if root == "" {
-				root = project.Dir
-			}
-			root = filepath.Clean(root)
-			id := stableID("scan", repoRelative(resolution.RepoRoot, root))
-			unit := units[id]
-			if unit == nil {
-				unit = &ScanUnit{ID: id, Root: root, RelativeRoot: repoRelative(resolution.RepoRoot, root), Relations: map[string]string{}}
-				units[id] = unit
-			}
-			unit.TargetIDs = append(unit.TargetIDs, target.ID)
-			relation := RelationShared
-			if project == target.Project {
-				relation = RelationDirect
-			} else if target.IncludedReasons[filepath.Clean(project.Dir)] == InclusionTestDependent {
-				relation = RelationCompanion
-			}
-			if current := unit.Relations[target.ID]; current == RelationDirect {
-			} else {
-				unit.Relations[target.ID] = relation
-			}
-		}
-	}
-	var roots []string
-	for _, unit := range units {
-		roots = append(roots, unit.Root)
-	}
-	roots = dropNestedRoots(roots)
-	for id, unit := range units {
-		keep := false
-		for _, root := range roots {
-			if unit.Root == root {
-				keep = true
-			}
-		}
-		if !keep {
-			delete(units, id)
-		}
-	}
+	units, roots := unitsForTargets(resolution.RepoRoot, selected)
 	if options.IncludeRepoGlobal && !containsRoot(roots, filepath.Clean(resolution.RepoRoot)) {
-		id := stableID("scan", ".")
-		unit := &ScanUnit{ID: id, Root: resolution.RepoRoot, RelativeRoot: ".", Relations: map[string]string{}, TargetIDs: make([]string, 0, len(selected))}
-		for _, target := range selected {
-			unit.TargetIDs = append(unit.TargetIDs, target.ID)
-			unit.Relations[target.ID] = RelationRepositoryGlobal
-		}
-		unit.ExcludedDirs = RepoLevelExcludesForScanUnits(resolution.RepoRoot, roots)
-		units[id] = unit
+		units = append(units, repositoryGlobalUnit(resolution.RepoRoot, selected, roots))
 	}
-	// Every ownership root any selected target actually includes, repo-wide
-	// -- not just the ones the current unit itself serves. A project nested
-	// inside one unit's root can legitimately belong to a DIFFERENT selected
-	// target (e.g. two selected targets where one's directory sits inside
-	// the other's), and dropNestedRoots above may already have folded that
-	// project's own unit into this one; using the repo-wide set here means
-	// nestedForeignExcludes below can never exclude something the caller
-	// actually asked to scan, no matter how the units were folded together.
-	allIncludedRoots := make(map[string]bool)
-	for _, target := range selected {
-		for _, project := range target.Included {
-			root := project.OwnershipRoot
-			if root == "" {
-				root = project.Dir
-			}
-			allIncludedRoots[filepath.Clean(root)] = true
-		}
-	}
-
+	includedRoots := includedScanRoots(selected)
 	for _, unit := range units {
-		unit.TargetIDs = uniqueSorted(unit.TargetIDs)
-		unit.ExcludedDirs = uniqueSorted(unit.ExcludedDirs)
-		unit.Files, unit.Manifests, unit.Lockfiles = unitFiles(resolution.RepoRoot, unit.Root, resolution.Inventory)
-		unit.ExcludedDirs = append(unit.ExcludedDirs, generatedRelativeExcludes(unit.Root, options)...)
-		if filepath.Clean(unit.Root) != filepath.Clean(resolution.RepoRoot) {
-			// The repository-global residual unit (Root == RepoRoot) has its
-			// own, deliberately different exclusion rule immediately above
-			// (RepoLevelExcludesForScanUnits): it excludes only the
-			// currently-scheduled roots, so OTHER discovered-but-unselected
-			// projects remain visible to a repo-global scan by design. This
-			// nested-foreign check is narrower and only for a normal unit:
-			// something else discovered inside THIS unit's own directory
-			// tree that no selected target actually needs.
-			unit.ExcludedDirs = append(unit.ExcludedDirs, nestedForeignExcludes(unit.Root, allIncludedRoots, resolution.Projects)...)
-		}
-		for _, excluded := range resolution.Excluded {
-			abs := filepath.Join(resolution.RepoRoot, filepath.FromSlash(excluded))
-			if within(abs, unit.Root) {
-				rel, err := filepath.Rel(unit.Root, abs)
-				if err == nil && rel != "." {
-					unit.ExcludedDirs = append(unit.ExcludedDirs, filepath.ToSlash(rel))
-				}
-			}
-		}
-		unit.ExcludedDirs = uniqueSorted(unit.ExcludedDirs)
-		if filepath.Clean(unit.Root) != filepath.Clean(resolution.RepoRoot) {
-			unit.FallbackLockfiles = workspaceRootFallbackLockfiles(resolution, unit)
-		}
-		plan.Units = append(plan.Units, unit)
+		finalizeUnit(unit, resolution, selected, includedRoots, options)
 	}
-	sort.Slice(plan.Units, func(i, j int) bool { return plan.Units[i].ID < plan.Units[j].ID })
+	sort.Slice(units, func(i, j int) bool { return units[i].ID < units[j].ID })
+
+	plan := &ScanPlan{RepoRoot: resolution.RepoRoot, SelectedTargets: selected, Units: units, Inventory: resolution.Inventory}
 	for _, entry := range plan.Inventory {
 		if entry.Ownership == "unowned" {
 			plan.Unowned = append(plan.Unowned, entry.Path)
 		}
 	}
-	plan.Excluded = append(plan.Excluded, resolution.Excluded...)
-	plan.Excluded = append(plan.Excluded, generatedRelativeExcludes(resolution.RepoRoot, options)...)
-	plan.Excluded = uniqueSorted(plan.Excluded)
+	plan.Excluded = uniqueSorted(append(append([]string(nil), resolution.Excluded...), generatedRelativeExcludes(resolution.RepoRoot, options)...))
 	for _, project := range resolution.Projects {
 		if project.OwnershipAmbiguous {
 			plan.Ambiguous = append(plan.Ambiguous, project.ID)
 		}
 	}
-	sort.Strings(plan.Unowned)
 	sort.Strings(plan.Ambiguous)
-
-	plan.ComponentRelations = buildComponentRelations(selected)
-	plan.FileOwnership = buildFileOwnership(resolution, plan.ComponentRelations, selected)
+	plan.FileOwnership = buildFileOwnership(resolution, buildComponentRelations(selected), selected)
 	applyWorkspaceRootFallbackOwnership(plan, selected)
-
 	return plan, nil
 }
 
-// buildComponentRelations computes a deterministic relation for each
-// component relative to the set of selected targets:
-//   - direct:     the component is the primary component of exactly one target
-//   - shared:     the component is used by more than one selected target
-//   - companion:  the component is included only as a test dependent
-//   - repo-global: the component is not scheduled for any target (fallback)
-func buildComponentRelations(targets []*Target) map[string]string {
+// selectTargets returns the targets options asks for. Every requested ID
+// must have been discovered, also when AllTargets selects them anyway.
+func selectTargets(targets []*Target, options PlanOptions) ([]*Target, error) {
+	requested := make(map[string]bool)
+	for _, id := range options.TargetIDs {
+		requested[id] = true
+	}
+	selected := make([]*Target, 0)
+	discovered := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		discovered[target.ID] = true
+		if options.AllTargets || requested[target.ID] {
+			selected = append(selected, target)
+		}
+	}
+	var unknown []string
+	for id := range requested {
+		if !discovered[id] {
+			unknown = append(unknown, id)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return nil, fmt.Errorf("target ID(s) not discovered: %q", unknown)
+	}
+	if len(selected) == 0 && !options.AllTargets {
+		return nil, fmt.Errorf("no targets selected")
+	}
+	return selected, nil
+}
+
+// unitsForTargets creates one unit per scan root of the selected targets'
+// included projects. A unit whose root lies inside another unit's root is
+// folded into that enclosing unit, whose recursive scan already covers its
+// files; its targets carry over so they keep a unit (and their own
+// workspace-root fallback). roots are the remaining, non-nested unit roots.
+func unitsForTargets(repoRoot string, selected []*Target) (units []*ScanUnit, roots []string) {
+	byRoot := make(map[string]*ScanUnit)
+	for _, target := range selected {
+		for _, project := range target.Included {
+			root := project.ScanRoot()
+			unit := byRoot[root]
+			if unit == nil {
+				rel := repoRelative(repoRoot, root)
+				unit = &ScanUnit{ID: stableID("scan", rel), Root: root, RelativeRoot: rel, Relations: map[string]Relation{}}
+				byRoot[root] = unit
+				roots = append(roots, root)
+			}
+			unit.addTarget(target.ID, target.relationOf(project))
+		}
+	}
+	roots = dropNestedRoots(roots)
+	for _, root := range roots {
+		units = append(units, byRoot[root])
+	}
+	for root, unit := range byRoot {
+		if containsRoot(roots, root) {
+			continue
+		}
+		for _, enclosing := range roots {
+			if within(root, enclosing) {
+				for _, targetID := range unit.TargetIDs {
+					byRoot[enclosing].addTarget(targetID, unit.Relations[targetID])
+				}
+				break
+			}
+		}
+	}
+	return units, roots
+}
+
+// addTarget records that the unit serves targetID, keeping the strongest
+// relation when the target reaches the unit more than once.
+func (u *ScanUnit) addTarget(targetID string, relation Relation) {
+	u.TargetIDs = appendUniqueStr(u.TargetIDs, targetID)
+	if relation.rank() > u.Relations[targetID].rank() {
+		u.Relations[targetID] = relation
+	}
+}
+
+// relationOf is how one of the target's included projects relates to it.
+func (t *Target) relationOf(p *Project) Relation {
+	switch {
+	case p == t.Project:
+		return RelationDirect
+	case t.IncludedReasons[filepath.Clean(p.Dir)] == InclusionTestDependent:
+		return RelationCompanion
+	}
+	return RelationShared
+}
+
+// repositoryGlobalUnit covers the repository content outside every scheduled
+// root, once, for all selected targets. It excludes only those roots, so
+// discovered-but-unselected projects stay visible to it.
+func repositoryGlobalUnit(repoRoot string, selected []*Target, roots []string) *ScanUnit {
+	unit := &ScanUnit{ID: stableID("scan", "."), Root: repoRoot, RelativeRoot: ".", Relations: map[string]Relation{}, ExcludedDirs: residualExcludes(repoRoot, roots)}
+	for _, target := range selected {
+		unit.addTarget(target.ID, RelationRepositoryGlobal)
+	}
+	return unit
+}
+
+// includedScanRoots is every scan root any selected target includes. A unit
+// may have absorbed another target's nested root, so foreign-project
+// exclusion must consult all of them, not just the unit's own.
+func includedScanRoots(selected []*Target) map[string]bool {
+	roots := make(map[string]bool)
+	for _, target := range selected {
+		for _, project := range target.Included {
+			roots[project.ScanRoot()] = true
+		}
+	}
+	return roots
+}
+
+// finalizeUnit fills in the unit's file lists and exclusions: generated
+// reports and, for a unit below the repository root, every discovered
+// project nested in it that no selected target includes. It then decides
+// which repository-root lockfiles the unit's targets need.
+func finalizeUnit(unit *ScanUnit, resolution *Resolution, selected []*Target, includedRoots map[string]bool, options PlanOptions) {
+	sort.Strings(unit.TargetIDs)
+	unit.Files, unit.Manifests, unit.Lockfiles = unitFiles(resolution.RepoRoot, unit.Root, resolution.Inventory)
+	unit.ExcludedDirs = append(unit.ExcludedDirs, generatedRelativeExcludes(unit.Root, options)...)
+	atRepoRoot := filepath.Clean(unit.Root) == filepath.Clean(resolution.RepoRoot)
+	if !atRepoRoot {
+		unit.ExcludedDirs = append(unit.ExcludedDirs, nestedForeignExcludes(unit.Root, includedRoots, resolution.Projects)...)
+	}
+	for _, excluded := range resolution.Excluded {
+		abs := filepath.Join(resolution.RepoRoot, filepath.FromSlash(excluded))
+		if within(abs, unit.Root) && abs != filepath.Clean(unit.Root) {
+			unit.ExcludedDirs = append(unit.ExcludedDirs, repoRelative(unit.Root, abs))
+		}
+	}
+	unit.ExcludedDirs = uniqueSorted(unit.ExcludedDirs)
+	if !atRepoRoot {
+		unit.FallbackLockfiles = workspaceRootFallbackLockfiles(resolution, selected, unit)
+	}
+}
+
+// buildComponentRelations gives each component used by a selected target its
+// relation: shared when several selected targets use it, companion when its
+// only user includes it as a test dependent, direct otherwise.
+func buildComponentRelations(targets []*Target) map[string]Relation {
 	usage := make(map[string]map[string]InclusionReason)
 	for _, target := range targets {
 		for _, project := range target.Included {
@@ -440,36 +379,32 @@ func buildComponentRelations(targets []*Target) map[string]string {
 				usage[cid] = make(map[string]InclusionReason)
 			}
 			reason := target.IncludedReasons[filepath.Clean(project.Dir)]
-			existing := usage[cid][target.ID]
-			if inclusionPriority(reason) > inclusionPriority(existing) {
+			if reason.rank() > usage[cid][target.ID].rank() {
 				usage[cid][target.ID] = reason
 			}
 		}
 	}
 
-	relations := make(map[string]string, len(usage))
+	relations := make(map[string]Relation, len(usage))
 	for cid, targetReasons := range usage {
+		relations[cid] = RelationDirect
 		if len(targetReasons) > 1 {
 			relations[cid] = RelationShared
 			continue
 		}
 		for _, reason := range targetReasons {
-			if reason == InclusionPrimary {
-				relations[cid] = RelationDirect
-			} else if reason == InclusionTestDependent {
+			if reason == InclusionTestDependent {
 				relations[cid] = RelationCompanion
-			} else {
-				relations[cid] = RelationDirect
 			}
 		}
 	}
 	return relations
 }
 
-// buildFileOwnership creates a canonical ownership map for every file in
-// the inventory. The map is keyed by repo-relative POSIX path and provides
-// deterministic component, target, relation and context for each file.
-func buildFileOwnership(resolution *Resolution, componentRelations map[string]string, targets []*Target) map[string]*FileOwnership {
+// buildFileOwnership records, for every inventoried file (keyed by its
+// repository-relative POSIX path), the components and selected targets that
+// own it, its strongest relation to them and its context.
+func buildFileOwnership(resolution *Resolution, componentRelations map[string]Relation, targets []*Target) map[string]*FileOwnership {
 	componentTargets := make(map[string][]string)
 	for _, target := range targets {
 		for _, project := range target.Included {
@@ -482,17 +417,14 @@ func buildFileOwnership(resolution *Resolution, componentRelations map[string]st
 	for _, entry := range resolution.Inventory {
 		fo := &FileOwnership{
 			ComponentIDs: entry.ComponentIDs,
-			Context:      aggregationContextForPath(entry.Path),
+			Relation:     RelationRepositoryGlobal,
+			Context:      aggregation.ContextForPath(entry.Path),
 		}
 		for _, cid := range entry.ComponentIDs {
 			fo.TargetIDs = appendUniqueStr(fo.TargetIDs, componentTargets[cid]...)
-			rel := componentRelations[cid]
-			if relationPriority(rel) > relationPriority(fo.Relation) {
+			if rel := componentRelations[cid]; rel.rank() > fo.Relation.rank() {
 				fo.Relation = rel
 			}
-		}
-		if fo.Relation == "" {
-			fo.Relation = RelationRepositoryGlobal
 		}
 		sort.Strings(fo.TargetIDs)
 		sort.Strings(fo.ComponentIDs)
@@ -515,96 +447,55 @@ func appendUniqueStr(s []string, values ...string) []string {
 	return s
 }
 
-func relationPriority(r string) int {
-	switch r {
-	case RelationDirect:
-		return 4
-	case RelationCompanion:
-		return 3
-	case RelationShared:
-		return 2
-	case RelationRepositoryGlobal:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func aggregationContextForPath(path string) string {
-	// Delegate to the aggregation package's canonical classification. Import
-	// would create a cycle, so inline the same logic. The authoritative copy
-	// lives in internal/aggregation.ContextForPath; if the two ever diverge,
-	// tests will catch the mismatch because the same file must never get two
-	// different contexts.
-	return contextForPathLocal(path)
-}
-
-func contextForPathLocal(repoRelativePath string) string {
-	path := strings.ToLower(filepath.ToSlash(repoRelativePath))
-	base := filepath.Base(path)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-
-	for _, docStem := range []string{
-		"readme", "changelog", "changes", "contributing", "contributors",
-		"license", "licence", "notice", "authors", "troubleshooting",
-		"code_of_conduct", "code-of-conduct", "security", "history",
-	} {
-		if stem == docStem {
-			return "docs"
+// OwnershipOf returns the ownership of file, given as an absolute path or
+// relative to the repository root. A file outside the inventory belongs to
+// no selected target.
+func (p *ScanPlan) OwnershipOf(file string) FileOwnership {
+	rel := file
+	if filepath.IsAbs(file) {
+		if r, err := filepath.Rel(p.RepoRoot, file); err == nil {
+			rel = r
 		}
 	}
-
-	dirTags := map[string]string{
-		"generated": "generated", "test": "test", "tests": "test",
-		"__tests__": "test", "testing": "test", "testdata": "test",
-		"fixture": "fixture", "fixtures": "fixture", "testfixtures": "fixture",
-		"docs": "docs", "documentation": "docs", "doc": "docs",
-		"examples": "example", "example": "example", "samples": "example",
-		".github": "ci", "ci": "ci", ".circleci": "ci", ".azure-pipelines": "ci",
-		"scripts": "build", "script": "build", "tools": "build",
-		"deploy": "deployment", "deployment": "deployment", "infra": "deployment",
-		"terraform": "deployment", "helm": "deployment", "k8s": "deployment",
-		"build": "build",
-		"vendor": "vendored", "third_party": "vendored", "third-party": "vendored", "external": "vendored",
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if ownership := p.FileOwnership[rel]; ownership != nil {
+		return *ownership
 	}
-	for _, part := range strings.Split(path, "/") {
-		if label, ok := dirTags[part]; ok {
-			return label
-		}
-	}
-	return "production"
+	return FileOwnership{Relation: RelationRepositoryGlobal, Context: aggregation.ContextForPath(rel)}
 }
 
-// LookupFileOwnership returns the canonical ownership for a repo-relative
-// POSIX path. If the exact path is not in the precomputed map, it walks up
-// the directory hierarchy looking for any parent whose ownership is known,
-// then falls back to repo-global.
-func LookupFileOwnership(plan *ScanPlan, relPath string) *FileOwnership {
-	relPath = filepath.ToSlash(filepath.Clean(relPath))
-	if fo := plan.FileOwnership[relPath]; fo != nil {
-		return fo
-	}
-	dir := relPath
-	for {
-		parent := filepath.ToSlash(filepath.Dir(dir))
-		if parent == dir || parent == "." || parent == "" {
-			break
-		}
-		dir = parent
-		if fo := plan.FileOwnership[dir]; fo != nil {
-			return &FileOwnership{
-				ComponentIDs: fo.ComponentIDs,
-				TargetIDs:    fo.TargetIDs,
-				Relation:     fo.Relation,
-				Context:      contextForPathLocal(relPath),
+// TargetSummaries describes every selected target -- including one with no
+// findings -- with the units that scan it and its finding counts.
+func (p *ScanPlan) TargetSummaries(rawFindings, uniqueFindings map[string]int) []TargetSummary {
+	summaries := make([]TargetSummary, 0, len(p.SelectedTargets))
+	for _, target := range p.SelectedTargets {
+		var unitIDs []string
+		for _, unit := range p.Units {
+			if containsString(unit.TargetIDs, target.ID) {
+				unitIDs = append(unitIDs, unit.ID)
 			}
 		}
+		summaries = append(summaries, TargetSummary{
+			TargetID:       target.ID,
+			Name:           target.Name,
+			ProjectID:      target.Project.ID,
+			ComponentID:    target.ComponentID,
+			OwnershipRoot:  repoRelative(p.RepoRoot, target.Project.ScanRoot()),
+			ScanUnitIDs:    unitIDs,
+			RawFindings:    rawFindings[target.ID],
+			UniqueFindings: uniqueFindings[target.ID],
+		})
 	}
-	return &FileOwnership{
-		Relation: RelationRepositoryGlobal,
-		Context:  contextForPathLocal(relPath),
+	return summaries
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
 	}
+	return false
 }
 
 func containsRoot(roots []string, wanted string) bool {
@@ -633,23 +524,6 @@ func unitFiles(repoRoot, root string, inventory []InventoryEntry) ([]string, []s
 	}
 	return files, manifests, lockfiles
 }
-// unitEcosystems returns the set of Project.Ecosystem values for every
-// project whose ownership root is exactly unitRoot -- i.e. which
-// ecosystem(s) this physical scan unit actually represents.
-func unitEcosystems(projects []*Project, unitRoot string) map[string]bool {
-	result := make(map[string]bool)
-	clean := filepath.Clean(unitRoot)
-	for _, p := range projects {
-		root := p.OwnershipRoot
-		if root == "" {
-			root = p.Dir
-		}
-		if filepath.Clean(root) == clean && p.Ecosystem != "" {
-			result[p.Ecosystem] = true
-		}
-	}
-	return result
-}
 
 // isExcludedFromUnit reports whether abs (an absolute path already known to
 // be within unit.Root) falls under one of unit's own finalized ExcludedDirs.
@@ -667,83 +541,118 @@ func isExcludedFromUnit(unit *ScanUnit, abs string) bool {
 	return false
 }
 
-// unitHasOwnLockfile reports whether unit's own scan scope -- respecting its
-// own (already-finalized) exclusions -- contains at least one lockfile of
-// its own. A lockfile that only exists because of a foreign nested project
-// unit.ExcludedDirs already prunes does not count: that file will never
-// actually reach the scanner.
-func unitHasOwnLockfile(repoRoot string, unit *ScanUnit, inventory []InventoryEntry) bool {
-	for _, entry := range inventory {
+// workspaceRootFallbackLockfiles returns each repo-root-level lockfile that
+// must back up unit's own SCA scope, mapped to the IDs of the selected
+// targets that need it. A target needs a root lockfile when a project it
+// includes inside this unit (and not pruned from it) is not already pinned
+// by a lockfile of its own ecosystem family (lockfilePinsProject), and that
+// root lockfile can pin it (rootLockfileCanPin). The decision is made per
+// project and per family: a Python package's uv.lock says nothing about the
+// Node package next to it, and a nested project's own lockfile says nothing
+// about the project enclosing it. Only projects a target actually includes
+// count: anything else under the unit merely shares its directory (a client
+// script beside a server, say) and must not pull unrelated lockfiles into
+// that target's results.
+func workspaceRootFallbackLockfiles(resolution *Resolution, selected []*Target, unit *ScanUnit) map[string][]string {
+	var rootLockfiles, unitLockfiles []string
+	for _, entry := range resolution.Inventory {
 		if !entry.Lockfile {
 			continue
 		}
-		abs := filepath.Join(repoRoot, filepath.FromSlash(entry.Path))
-		if !within(abs, unit.Root) {
+		abs := filepath.Join(resolution.RepoRoot, filepath.FromSlash(entry.Path))
+		switch {
+		case !strings.Contains(entry.Path, "/"):
+			rootLockfiles = append(rootLockfiles, entry.Path) // only the repository root's own direct files qualify
+		case within(abs, unit.Root) && !isExcludedFromUnit(unit, abs):
+			unitLockfiles = append(unitLockfiles, abs) // only files that actually reach this unit's scanner
+		}
+	}
+	if len(rootLockfiles) == 0 {
+		return nil
+	}
+	var projectRoots []string
+	for _, project := range resolution.Projects {
+		projectRoots = append(projectRoots, project.ScanRoot())
+	}
+
+	needed := make(map[string][]string)
+	for _, target := range selected {
+		if !containsString(unit.TargetIDs, target.ID) {
 			continue
 		}
-		if isExcludedFromUnit(unit, abs) {
+		for _, project := range target.Included {
+			root := project.ScanRoot()
+			if !within(root, unit.Root) || isExcludedFromUnit(unit, root) {
+				continue
+			}
+			family := ecosystemFamily(project.Ecosystem)
+			if family == "" || lockfilePinsProject(unitLockfiles, family, root, unit.Root, projectRoots) {
+				continue
+			}
+			for _, lockfile := range rootLockfiles {
+				if rootLockfileCanPin(lockfile, project.Ecosystem) {
+					needed[lockfile] = appendUniqueStr(needed[lockfile], target.ID)
+				}
+			}
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	return needed
+}
+
+// lockfilePinsProject reports whether one of lockfiles (absolute paths) of
+// the given ecosystem family pins the project rooted at root inside a unit
+// rooted at unitRoot: a lockfile in root itself or in an enclosing directory
+// within the unit (a workspace root above the project), or one deeper in the
+// project's own tree that does not belong to another project nested there.
+func lockfilePinsProject(lockfiles []string, family, root, unitRoot string, projectRoots []string) bool {
+	for _, lockfile := range lockfiles {
+		if lockfileEcosystem(filepath.Base(lockfile)) != family {
 			continue
 		}
-		return true
+		dir := filepath.Dir(lockfile)
+		if within(root, dir) && within(dir, unitRoot) {
+			return true // in the project's own directory or a workspace root above it
+		}
+		if within(lockfile, root) && !insideNestedProject(lockfile, root, projectRoots) {
+			return true
+		}
 	}
 	return false
 }
 
-// workspaceRootFallbackLockfiles returns the repo-root-level lockfile
-// path(s) that should back up unit's own SCA scope, or nil when unit already
-// has its own lockfile (the common case) or the repository root has no
-// lockfile matching an ecosystem unit actually uses. Evidenced by real
-// npm/yarn/pnpm workspaces, where every member's package.json shares one
-// package-lock.json at the workspace root; Cargo workspaces follow the same
-// pattern with one root Cargo.lock. Matching is ecosystem-aware so a Python
-// unit is never backed by an unrelated root-level package-lock.json.
-func workspaceRootFallbackLockfiles(resolution *Resolution, unit *ScanUnit) []string {
-	ecosystems := unitEcosystems(resolution.Projects, unit.Root)
-	if len(ecosystems) == 0 {
-		return nil
-	}
-	if unitHasOwnLockfile(resolution.RepoRoot, unit, resolution.Inventory) {
-		return nil
-	}
-	var fallback []string
-	for _, entry := range resolution.Inventory {
-		if !entry.Lockfile || filepath.ToSlash(filepath.Dir(entry.Path)) != "." {
-			continue // only the repository root's own direct files qualify
-		}
-		eco := lockfileEcosystem(filepath.Base(entry.Path))
-		if eco != "" && ecosystems[eco] {
-			fallback = append(fallback, entry.Path)
+// insideNestedProject reports whether path lies inside some project root
+// nested strictly below root.
+func insideNestedProject(path, root string, projectRoots []string) bool {
+	for _, other := range projectRoots {
+		if other != root && within(other, root) && within(path, other) {
+			return true
 		}
 	}
-	sort.Strings(fallback)
-	return fallback
+	return false
 }
 
 // applyWorkspaceRootFallbackOwnership attributes each workspace-root
-// fallback lockfile (ScanUnit.FallbackLockfiles) to every target that relies
-// on it, merging into whatever buildFileOwnership already computed. Without
-// this, a finding from a repo-root lockfile would be attributed as
-// unowned/repository-global purely because the file itself sits outside
-// every target's own directory tree, even though it was fetched specifically
-// on a target's behalf.
+// fallback lockfile to exactly the targets that rely on it, merging into
+// buildFileOwnership's record. The file sits outside every target's own
+// tree, so without this its findings would belong to no target.
 func applyWorkspaceRootFallbackOwnership(plan *ScanPlan, selected []*Target) {
 	targetComponent := make(map[string]string, len(selected))
 	for _, t := range selected {
 		targetComponent[t.ID] = t.ComponentID
 	}
 	for _, unit := range plan.Units {
-		if len(unit.FallbackLockfiles) == 0 {
-			continue
-		}
-		var targetIDs, componentIDs []string
-		for _, tid := range unit.TargetIDs {
-			targetIDs = appendUniqueStr(targetIDs, tid)
-			if cid := targetComponent[tid]; cid != "" {
-				componentIDs = appendUniqueStr(componentIDs, cid)
+		for path, reliantTargetIDs := range unit.FallbackLockfiles {
+			var targetIDs, componentIDs []string
+			for _, tid := range reliantTargetIDs {
+				targetIDs = appendUniqueStr(targetIDs, tid)
+				if cid := targetComponent[tid]; cid != "" {
+					componentIDs = appendUniqueStr(componentIDs, cid)
+				}
 			}
-		}
-		for _, path := range unit.FallbackLockfiles {
-			fo := &FileOwnership{Relation: RelationWorkspaceRoot, Context: contextForPathLocal(path)}
+			fo := &FileOwnership{Relation: RelationWorkspaceRoot, Context: aggregation.ContextForPath(path)}
 			if existing := plan.FileOwnership[path]; existing != nil {
 				fo.TargetIDs = appendUniqueStr(append([]string{}, existing.TargetIDs...), targetIDs...)
 				fo.ComponentIDs = appendUniqueStr(append([]string{}, existing.ComponentIDs...), componentIDs...)
@@ -768,9 +677,8 @@ func generatedRelativeExcludes(repoRoot string, options PlanOptions) []string {
 		if err != nil {
 			continue
 		}
-		rel, err := filepath.Rel(repoRoot, abs)
-		if err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
-			result = append(result, filepath.ToSlash(rel))
+		if within(abs, repoRoot) && abs != filepath.Clean(repoRoot) {
+			result = append(result, repoRelative(repoRoot, abs))
 		}
 	}
 	return result

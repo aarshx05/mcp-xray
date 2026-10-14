@@ -37,10 +37,12 @@ func TestScanRoots_DedupesAndDropsNestedRoots(t *testing.T) {
 	}
 }
 
-func TestPrimaryRoot(t *testing.T) {
-	target := &Target{Project: &Project{Dir: "/repo/server/"}}
-	if got := target.PrimaryRoot(); got != filepath.Clean("/repo/server/") {
-		t.Errorf("PrimaryRoot() = %q, want %q", got, filepath.Clean("/repo/server/"))
+func TestProjectScanRoot(t *testing.T) {
+	if got := (&Project{Dir: "/repo/server/"}).ScanRoot(); got != filepath.Clean("/repo/server") {
+		t.Errorf("ScanRoot() without an ownership root = %q, want the project directory", got)
+	}
+	if got := (&Project{Dir: "/repo/server/src", OwnershipRoot: "/repo/server/"}).ScanRoot(); got != filepath.Clean("/repo/server") {
+		t.Errorf("ScanRoot() = %q, want the ownership root", got)
 	}
 }
 
@@ -83,49 +85,18 @@ func TestDiscoveredManifests_NoRootsFindsNothing(t *testing.T) {
 	}
 }
 
-func TestRepoLevelExcludes_ReturnsAllProjectDirsRelativeToRoot(t *testing.T) {
+func TestResidualExcludes(t *testing.T) {
 	root := t.TempDir()
-	projects := []*Project{
-		{Dir: filepath.Join(root, "servers", "server-a")},
-		{Dir: filepath.Join(root, "servers", "server-b")},
-		{Dir: filepath.Join(root, "packages", "shared")},
+	roots := []string{
+		filepath.Join(root, "servers", "server-b"),
+		filepath.Join(root, "packages", "shared"),
+		filepath.Join(root, "servers", "server-b"), // duplicate
+		root,               // the repository itself is never excluded
+		filepath.Dir(root), // nor is anything outside it
 	}
-	excludes := RepoLevelExcludes(root, projects)
-	if len(excludes) != 3 {
-		t.Fatalf("expected 3 excludes, got %d: %v", len(excludes), excludes)
-	}
-	want := map[string]bool{
-		filepath.Join("packages", "shared"):   true,
-		filepath.Join("servers", "server-a"):  true,
-		filepath.Join("servers", "server-b"):  true,
-	}
-	for _, e := range excludes {
-		if !want[e] {
-			t.Errorf("unexpected exclude %q", e)
-		}
-	}
-}
-
-func TestRepoLevelExcludes_SkipsProjectAtRepoRoot(t *testing.T) {
-	root := t.TempDir()
-	projects := []*Project{
-		{Dir: root},
-	}
-	excludes := RepoLevelExcludes(root, projects)
-	if len(excludes) != 0 {
-		t.Errorf("project at repo root should be skipped (rel='.'), got %v", excludes)
-	}
-}
-
-func TestRepoLevelExcludes_DedupesIdenticalDirs(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, "server")
-	projects := []*Project{
-		{Dir: dir},
-		{Dir: dir},
-	}
-	excludes := RepoLevelExcludes(root, projects)
-	if len(excludes) != 1 {
-		t.Fatalf("expected deduplication to 1, got %d: %v", len(excludes), excludes)
+	got := residualExcludes(root, roots)
+	want := []string{"packages/shared", "servers/server-b"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("residualExcludes = %v, want %v", got, want)
 	}
 }

@@ -38,9 +38,6 @@ func printDiscoveredTargets(targets []*targetresolve.Target, allProjects []*targ
 		if len(t.Project.Evidence) > 0 {
 			fmt.Printf("     evidence: %s\n", strings.Join(t.Project.Evidence, "; "))
 		}
-		if len(t.Project.WorkspaceSources) > 0 {
-			fmt.Printf("     workspace: %s\n", strings.Join(t.Project.WorkspaceSources, ", "))
-		}
 		if len(t.Project.BinNames) > 0 {
 			fmt.Printf("     bin: %s\n", strings.Join(t.Project.BinNames, ", "))
 		}
@@ -133,23 +130,13 @@ func printNotIncludedSiblings(t *targetresolve.Target, allProjects []*targetreso
 	}
 }
 
-// selectTarget resolves which target to scan:
-//   - an exact --target match, if one was given;
+// selectTarget resolves which target to scan when neither --target nor
+// --target-id was given (a --target name is resolved by targetByName first):
 //   - the single discovered target, automatically, if there is only one;
-//   - an interactive numbered picker, if stdin is a terminal and no --target
-//     was given;
+//   - an interactive numbered picker, if stdin is a terminal;
 //   - otherwise a fail-fast error printing the discovered list and the exact
-//     --target value to pass, so a CI/non-TTY run never guesses.
-func selectTarget(targets []*targetresolve.Target, allProjects []*targetresolve.Project, repoRoot string, requested string) (*targetresolve.Target, error) {
-	if requested != "" {
-		for _, t := range targets {
-			if t.Name == requested {
-				return t, nil
-			}
-		}
-		return nil, fmt.Errorf("no MCP target named %q was discovered.\n%s", requested, formatTargetListForError(targets))
-	}
-
+//     flag to pass for each target, so a CI/non-TTY run never guesses.
+func selectTarget(targets []*targetresolve.Target, allProjects []*targetresolve.Project, repoRoot string) (*targetresolve.Target, error) {
 	if len(targets) == 1 {
 		return targets[0], nil
 	}
@@ -158,7 +145,30 @@ func selectTarget(targets []*targetresolve.Target, allProjects []*targetresolve.
 		return promptForTarget(targets, allProjects, repoRoot)
 	}
 
-	return nil, fmt.Errorf("multiple MCP targets discovered and no --target given; not prompting because stdin is not a terminal.\n%s", formatTargetListForError(targets))
+	return nil, fmt.Errorf("multiple MCP targets discovered and no --target given; not prompting because stdin is not a terminal.\n%s", formatTargetListForError("Discovered MCP targets:", targets, repoRoot))
+}
+
+// targetByName returns the single target whose display name is exactly
+// name. Names are display values, not identities -- two servers in one
+// monorepo can both be named "server" -- so silently picking whichever one
+// sorts first would scan the wrong server. An ambiguous name is therefore an
+// error listing only the clashing targets, each with the --target-id that
+// selects it unambiguously.
+func targetByName(targets []*targetresolve.Target, repoRoot, name string) (*targetresolve.Target, error) {
+	var matches []*targetresolve.Target
+	for _, t := range targets {
+		if t.Name == name {
+			matches = append(matches, t)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no MCP target named %q was discovered.\n%s", name, formatTargetListForError("Discovered MCP targets:", targets, repoRoot))
+	case 1:
+		return matches[0], nil
+	default:
+		return nil, fmt.Errorf("%d MCP targets are named %q; pass --target-id to choose one.\n%s", len(matches), name, formatTargetListForError(fmt.Sprintf("MCP targets named %q:", name), matches, repoRoot))
+	}
 }
 
 // isInteractiveTerminal reports whether stdin is a terminal a user could
@@ -187,13 +197,28 @@ func promptForTarget(targets []*targetresolve.Target, allProjects []*targetresol
 	return targets[choice-1], nil
 }
 
-// formatTargetListForError renders the discovered-targets list, each with
-// the exact --target value to pass, for embedding in an error message.
-func formatTargetListForError(targets []*targetresolve.Target) string {
+// formatTargetListForError renders a target list under header for an error
+// message: each target with its location and ecosystem (enough to tell
+// same-named targets apart) and the exact flag that selects it. --target is
+// only suggested for a name no other listed target shares; a shared name can
+// only be selected with --target-id.
+func formatTargetListForError(header string, targets []*targetresolve.Target, repoRoot string) string {
+	nameCount := make(map[string]int, len(targets))
+	for _, t := range targets {
+		nameCount[t.Name]++
+	}
 	var sb strings.Builder
-	sb.WriteString("Discovered MCP targets:\n")
+	sb.WriteString(header + "\n")
 	for i, t := range targets {
-		sb.WriteString(fmt.Sprintf("  %d. %s -- pass --target %q or --target-id %q\n", i+1, t.Name, t.Name, t.ID))
+		location := ""
+		if t.Project != nil {
+			location = fmt.Sprintf(" (%s, %s)", displayPath(t.Project.Dir, repoRoot), t.Project.Ecosystem)
+		}
+		if nameCount[t.Name] > 1 {
+			sb.WriteString(fmt.Sprintf("  %d. %s%s -- pass --target-id %q\n", i+1, t.Name, location, t.ID))
+		} else {
+			sb.WriteString(fmt.Sprintf("  %d. %s%s -- pass --target %q or --target-id %q\n", i+1, t.Name, location, t.Name, t.ID))
+		}
 	}
 	return sb.String()
 }

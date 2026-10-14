@@ -40,9 +40,8 @@ func detectSubmoduleWarnings(repoRoot string) []string {
 }
 
 // parseGitmodulesPaths extracts every "path = ..." value from a .gitmodules
-// file. This is a minimal line-oriented reader rather than a full git-config
-// parser: .gitmodules only ever needs its "path" values here, and every
-// real-world .gitmodules file uses the simple "key = value" form this covers.
+// file. It is a line-oriented reader, not a git-config parser: only the
+// "path = ..." lines are needed, and .gitmodules files use that simple form.
 func parseGitmodulesPaths(data []byte) []string {
 	var paths []string
 	for _, line := range strings.Split(string(data), "\n") {

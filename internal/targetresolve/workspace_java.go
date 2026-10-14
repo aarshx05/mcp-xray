@@ -7,22 +7,19 @@ import (
 	"strings"
 )
 
-// pomXML is the minimal shape of a Maven pom.xml needed by this package:
-// its own coordinates (groupId/artifactId, with a parent-groupId fallback --
-// a standard Maven convention where a child module inherits groupId from
-// <parent> when it declares none of its own; proactive, not evidenced by
-// oracle/mcp's real pom.xml, which declares its own groupId directly) and
-// its <dependencies> (for SDK detection and local-dependency resolution).
-// The "dependencies>dependency" path deliberately only matches the
-// top-level <dependencies> element, not the version-constraint-only
-// <dependencyManagement><dependencies> block, which is a different parent
-// element and is never confused with real runtime dependencies here.
+// pomXML is the part of a Maven pom.xml this package reads: the module's
+// own coordinates (a child module without a groupId inherits its
+// <parent>'s) and its <dependencies>, for SDK detection and local
+// dependency resolution. The "dependencies>dependency" path matches only
+// the top-level <dependencies> element, never the version constraints in
+// <dependencyManagement>.
 type pomXML struct {
-	XMLName       xml.Name        `xml:"project"`
-	GroupID       string          `xml:"groupId"`
-	ArtifactID    string          `xml:"artifactId"`
-	ParentGroupID string          `xml:"parent>groupId"`
-	Dependencies  []pomDependency `xml:"dependencies>dependency"`
+	XMLName          xml.Name        `xml:"project"`
+	GroupID          string          `xml:"groupId"`
+	ArtifactID       string          `xml:"artifactId"`
+	ParentGroupID    string          `xml:"parent>groupId"`
+	ParentArtifactID string          `xml:"parent>artifactId"`
+	Dependencies     []pomDependency `xml:"dependencies>dependency"`
 }
 
 type pomDependency struct {
@@ -44,19 +41,59 @@ func readPom(manifestPath string) (*pomXML, error) {
 }
 
 // effectiveGroupID returns the module's own groupId, falling back to its
-// parent POM's groupId.
+// parent POM's groupId. An own groupId written in terms of the parent's
+// coordinates (${project.parent.groupId}) is resolved; a self-reference would
+// be circular and is kept verbatim, like any other expression.
 func (doc *pomXML) effectiveGroupID() string {
-	if doc.GroupID != "" {
-		return doc.GroupID
+	if groupID := strings.TrimSpace(doc.GroupID); groupID != "" {
+		return coordinateReplacer(doc.parentCoordinates()).Replace(groupID)
 	}
-	return doc.ParentGroupID
+	return strings.TrimSpace(doc.ParentGroupID)
 }
 
-// newJavaProject builds a Project from a discovered pom.xml file. Name
-// prefers artifactId -- Maven's own conventional module identifier,
-// confirmed by oracle/mcp's real oracle-db-mcp-toolkit
-// (artifactId=oracle-db-mcp-toolkit) -- falling back to the directory
-// basename for a pom.xml that parsed but declares no artifactId.
+// parentCoordinates returns the parent POM's coordinates keyed by the model
+// field Maven expressions use for them.
+func (doc *pomXML) parentCoordinates() [][2]string {
+	return [][2]string{
+		{"parent.groupId", strings.TrimSpace(doc.ParentGroupID)},
+		{"parent.artifactId", strings.TrimSpace(doc.ParentArtifactID)},
+	}
+}
+
+// resolveBuiltinExpressions substitutes Maven's built-in project-coordinate
+// expressions in a dependency coordinate with this POM's own values. Sibling
+// modules are very commonly declared as
+// <groupId>${project.groupId}</groupId>; without this the raw expression
+// never equals any module's resolved groupId, and the sibling edge is
+// silently dropped from the target's scope. User-defined <properties> are
+// deliberately not interpolated: they may be inherited from a parent POM
+// this package does not resolve, so a partial answer could be wrong (such
+// text is compared verbatim instead -- see javaCoordinate).
+func (doc *pomXML) resolveBuiltinExpressions(value string) string {
+	if !strings.Contains(value, "${") {
+		return value
+	}
+	fields := append([][2]string{
+		{"groupId", doc.effectiveGroupID()},
+		{"artifactId", strings.TrimSpace(doc.ArtifactID)},
+	}, doc.parentCoordinates()...)
+	return coordinateReplacer(fields).Replace(value)
+}
+
+// coordinateReplacer substitutes every spelling Maven 3 accepts for each
+// {field, value} pair: ${project.<field>}, the deprecated Maven 2 alias
+// ${pom.<field>}, and the deprecated unprefixed ${<field>}.
+func coordinateReplacer(fields [][2]string) *strings.Replacer {
+	pairs := make([]string, 0, len(fields)*6)
+	for _, field := range fields {
+		name, value := field[0], field[1]
+		pairs = append(pairs, "${project."+name+"}", value, "${pom."+name+"}", value, "${"+name+"}", value)
+	}
+	return strings.NewReplacer(pairs...)
+}
+
+// newJavaProject builds a Project from a discovered pom.xml file, named by
+// its artifactId, or its directory when it declares none.
 func newJavaProject(manifestPath string) (*Project, error) {
 	doc, err := readPom(manifestPath)
 	if err != nil {
@@ -78,13 +115,12 @@ func newJavaProject(manifestPath string) (*Project, error) {
 }
 
 // javaGroupIDDependency reports whether doc has a dependency whose groupId
-// equals prefix or starts with prefix+".", the same prefix-matching
-// convention already used for .NET (dotnetPackageReferencePrefix) and Go
-// (module-path prefix match). Confirmed necessary by oracle/mcp's real
-// dependency: groupId "io.modelcontextprotocol.sdk", artifactId "mcp".
+// equals groupIDPrefix or starts with groupIDPrefix+"." (the SDK is
+// io.modelcontextprotocol.sdk:mcp).
 func javaGroupIDDependency(doc *pomXML, groupIDPrefix string) bool {
 	for _, dep := range doc.Dependencies {
-		if dep.GroupID == groupIDPrefix || strings.HasPrefix(dep.GroupID, groupIDPrefix+".") {
+		groupID := strings.TrimSpace(doc.resolveBuiltinExpressions(dep.GroupID))
+		if groupID == groupIDPrefix || strings.HasPrefix(groupID, groupIDPrefix+".") {
 			return true
 		}
 	}
@@ -94,17 +130,12 @@ func javaGroupIDDependency(doc *pomXML, groupIDPrefix string) bool {
 // resolveJavaLocalDeps fills in LocalDeps for every discovered Java project
 // by matching each <dependency>'s groupId:artifactId against another
 // discovered Java project's own effective coordinates. Maven has no
-// file-path-based local-dependency mechanism analogous to Node's
-// file:/link: protocols or .NET's ProjectReference -- a local module
-// dependency is expressed exactly like a Maven Central one, distinguished
-// only by whether its coordinates happen to resolve to a module physically
-// present in this repo. This mirrors the same accepted-tradeoff pattern
-// already used for Go (a require entry matching a known local module path
-// needs no replace directive) and Node (a plain-version dependency matching
-// a local project's declared name): a same-coordinate collision with an
-// unrelated registry-published artifact is possible in theory, not solvable
-// without a Maven Central lookup, and no repo examined this session shows
-// it causing a real false positive.
+// path-based local dependency: a module dependency is written exactly like
+// a Maven Central one, so a dependency is local when its coordinates name a
+// module in this repository. As with Go module paths and Node package
+// names, an unrelated published artifact with the same coordinates would be
+// mistaken for the local module; telling them apart needs a registry
+// lookup.
 func resolveJavaLocalDeps(projects []*Project) {
 	byCoordinate := make(map[string]*Project)
 	for _, p := range projects {
@@ -132,7 +163,7 @@ func resolveJavaLocalDeps(projects []*Project) {
 			continue
 		}
 		for _, dep := range doc.Dependencies {
-			coord := javaCoordinate(dep.GroupID, dep.ArtifactID)
+			coord := javaCoordinate(doc.resolveBuiltinExpressions(dep.GroupID), doc.resolveBuiltinExpressions(dep.ArtifactID))
 			if coord == "" {
 				continue
 			}
@@ -143,7 +174,14 @@ func resolveJavaLocalDeps(projects []*Project) {
 	}
 }
 
+// javaCoordinate returns groupId:artifactId, or "" when either is missing.
+// Values are trimmed, as Maven itself does, since pretty-printed POMs may
+// wrap them. An expression left unresolved is kept verbatim, so modules that
+// all spell their coordinates with the same reactor-wide property (say
+// ${revision.group}) still match each other -- accepting that two unrelated
+// builds in one repository reusing a property name would match too.
 func javaCoordinate(groupID, artifactID string) string {
+	groupID, artifactID = strings.TrimSpace(groupID), strings.TrimSpace(artifactID)
 	if groupID == "" || artifactID == "" {
 		return ""
 	}

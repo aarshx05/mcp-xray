@@ -70,87 +70,16 @@ type Message struct {
 	Text string `json:"text"`
 }
 
-// GenerateSarifWithProperties is the additive reporting path used by the
-// multi-target planner. The input findings are still the original scanner
-// findings; properties carry attribution/fingerprint/context separately.
-// runProperties, when non-nil, is attached to the SARIF Run object so
-// target summaries, scan plans and execution records are visible in output
-// even when a target produces zero findings.
-func GenerateSarifWithProperties(findings []*proto.Finding, properties []map[string]interface{}, repoRoot string, runProperties map[string]interface{}) ([]byte, error) {
-	return generateSarifWithProperties(findings, nil, properties, repoRoot, runProperties)
-}
-
-// GenerateSarif builds a SARIF report from findings. Used by config-scan,
-// pentest, verify, and the legacy (no target-resolution) repo-scan path.
+// GenerateSarif builds a SARIF report from findings.
 func GenerateSarif(findings []*proto.Finding) ([]byte, error) {
-	return generateSarifWithProperties(findings, nil, nil, "", nil)
+	return GenerateSarifWithProperties(findings, nil, "", nil)
 }
 
-// GenerateSarifForTarget builds a SARIF report the same way GenerateSarif
-// does, additionally tagging each result with how it relates to a resolved
-// target-resolution target (internal/targetresolve): "direct" for a finding
-// inside the selected server's own directory, "test-dependent" for a finding
-// inside a test/tooling project that depends on the server rather than the
-// reverse (targetresolve.InclusionTestDependent), "shared-dependency" for a
-// finding inside any other included directory (a workspace-local dependency
-// the server needs), and "repo-level" for anything else (or a finding with
-// no file path at all). This is additive -- GenerateSarif's own signature
-// and output are untouched, so config-scan, pentest, and verify require no
-// changes.
-//
-// reasons maps a cleaned included directory to why it was included
-// (targetresolve.Target.IncludedReasons); a nil or empty map degrades
-// gracefully to the original direct/shared-dependency/repo-level behavior
-// (every included root not equal to primaryRoot is reported as
-// "shared-dependency", as before).
-func GenerateSarifForTarget(findings []*proto.Finding, primaryRoot string, includedRoots []string, reasons map[string]string) ([]byte, error) {
-	primaryRoot = filepath.Clean(primaryRoot)
-	cleanedIncluded := make([]string, len(includedRoots))
-	for i, r := range includedRoots {
-		cleanedIncluded[i] = filepath.Clean(r)
-	}
-
-	relation := func(findingFile string) string {
-		if findingFile == "" {
-			return "repo-level"
-		}
-		cleaned := filepath.Clean(findingFile)
-		if isWithinRoot(cleaned, primaryRoot) {
-			return "direct"
-		}
-		for _, root := range cleanedIncluded {
-			if isWithinRoot(cleaned, root) {
-				reason := reasons[root]
-				if reason == "" {
-					reason = reasons[filepath.ToSlash(root)]
-				}
-				if reason == "test-dependent" {
-					return "test-dependent"
-				}
-				return "shared-dependency"
-			}
-		}
-		return "repo-level"
-	}
-
-	return generateSarifWithProperties(findings, relation, nil, "", nil)
-}
-
-// isWithinRoot reports whether path is root itself or lives under it.
-func isWithinRoot(path, root string) bool {
-	path, root = filepath.ToSlash(filepath.Clean(path)), filepath.ToSlash(filepath.Clean(root))
-	return path == root || strings.HasPrefix(path, root+"/")
-}
-
-// generateSarif is the shared implementation behind GenerateSarif and
-// GenerateSarifForTarget. relation is nil for the plain (non-target-scoped)
-// path; when non-nil, it is called with each finding's File to compute a
-// "targetRelation" SARIF property.
-func generateSarif(findings []*proto.Finding, relation func(findingFile string) string) ([]byte, error) {
-	return generateSarifWithProperties(findings, relation, nil, "", nil)
-}
-
-func generateSarifWithProperties(findings []*proto.Finding, relation func(findingFile string) string, additional []map[string]interface{}, repoRoot string, runProperties map[string]interface{}) ([]byte, error) {
+// GenerateSarifWithProperties builds a SARIF report in which
+// resultProperties[i] is merged into the properties of findings[i]'s result
+// and runProperties, when non-nil, is attached to the run. A finding's file
+// under repoRoot is reported repository-relative.
+func GenerateSarifWithProperties(findings []*proto.Finding, resultProperties []map[string]interface{}, repoRoot string, runProperties map[string]interface{}) ([]byte, error) {
 	// Build rules map
 	ruleMap := make(map[string]*ReportingRule)
 	for i := range findings {
@@ -179,21 +108,10 @@ func generateSarifWithProperties(findings []*proto.Finding, relation func(findin
 		return rules[i].ID < rules[j].ID
 	})
 
-	// Sort by severity (descending; proto values are in descending order) via
-	// an index permutation rather than reordering findings/additional
-	// directly. additional[i] is the per-finding property map for
-	// findings[i]; sorting findings alone (as this used to do) desyncs that
-	// pairing the moment two findings differ in severity, silently attaching
-	// fingerprint/targetIds/etc. to the wrong finding in the output. Indices
-	// keep both slices addressable by their original position, so the pairing
-	// survives the reorder, and neither the caller's findings slice nor
-	// additional is mutated -- callers such as the pentest flow reuse findings
-	// immediately after this call and should not see it silently reordered as
-	// a side effect of report generation. SliceStable keeps equal-severity
-	// findings in their original order, matching sort.Slice's prior behavior
-	// on ties (Go's sort.Slice is not guaranteed stable, but for equal keys
-	// the practical difference doesn't matter here; SliceStable just makes it
-	// deterministic).
+	// Order results by severity (descending; the proto values are in
+	// descending order) through an index permutation, which keeps
+	// resultProperties[i] paired with findings[i] and leaves the caller's
+	// slices unmodified. Equal severities keep their input order.
 	order := make([]int, len(findings))
 	for i := range order {
 		order[i] = i
@@ -267,11 +185,8 @@ func generateSarifWithProperties(findings []*proto.Finding, relation func(findin
 		if finding.Fixed != "" {
 			properties["fixed"] = finding.Fixed
 		}
-		if relation != nil {
-			properties["targetRelation"] = relation(finding.File)
-		}
-		if additional != nil && idx < len(additional) {
-			for key, value := range additional[idx] {
+		if idx < len(resultProperties) {
+			for key, value := range resultProperties[idx] {
 				properties[key] = value
 			}
 		}

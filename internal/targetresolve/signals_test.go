@@ -327,21 +327,30 @@ using ModelContextProtocol.Server;
 
 func TestIsTestShapedProject(t *testing.T) {
 	cases := []struct {
-		name string
-		dir  string
-		want bool
+		name   string
+		dir    string
+		relDir string
+		want   bool
 	}{
-		{"dotted Tests suffix", "/repo/Microsoft.ModelContextProtocol.HttpServer.Distributed.Tests", true},
-		{"tests path segment", "/repo/packages/tests/fixture-server", true},
-		{"__tests__ path segment", "/repo/packages/__tests__/fixture-server", true},
-		{"underscore test suffix", "/repo/packages/my_server_test", true},
-		{"plain project", "/repo/packages/my-server", false},
+		{"dotted Tests suffix", "/repo/Microsoft.ModelContextProtocol.HttpServer.Distributed.Tests", "Microsoft.ModelContextProtocol.HttpServer.Distributed.Tests", true},
+		{"tests path segment", "/repo/packages/tests/fixture-server", "packages/tests/fixture-server", true},
+		{"__tests__ path segment", "/repo/packages/__tests__/fixture-server", "packages/__tests__/fixture-server", true},
+		{"underscore test suffix", "/repo/packages/my_server_test", "packages/my_server_test", true},
+		{"plain project", "/repo/packages/my-server", "packages/my-server", false},
+		// The checkout's own location must never matter.
+		{"checkout under a tests ancestor", "/home/ci/tests/repo/packages/my-server", "packages/my-server", false},
+		{"checkout under a __tests__ ancestor", "/work/__tests__/repo/server", "server", false},
+		{"repository root named like a test project", "/home/ci/my_server_test", ".", false},
+		// Without a repository-relative location only the project's own
+		// directory name is trusted.
+		{"unknown relDir keeps own-name suffix check", "/repo/Foo.Tests", "", true},
+		{"unknown relDir ignores ancestor segments", "/repo/tests/server", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &Project{Dir: tc.dir}
+			p := &Project{Dir: tc.dir, RelDir: tc.relDir}
 			if got := isTestShapedProject(p); got != tc.want {
-				t.Errorf("isTestShapedProject(%q) = %v, want %v", tc.dir, got, tc.want)
+				t.Errorf("isTestShapedProject(dir=%q, relDir=%q) = %v, want %v", tc.dir, tc.relDir, got, tc.want)
 			}
 		})
 	}

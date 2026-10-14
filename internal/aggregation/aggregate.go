@@ -3,6 +3,7 @@ package aggregation
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 	"mcpxray/proto"
 )
 
+// AttributedFinding is one raw scanner finding together with the targets,
+// components and scan unit it is credited to.
 type AttributedFinding struct {
 	Finding      *proto.Finding
 	TargetIDs    []string
@@ -21,12 +24,16 @@ type AttributedFinding struct {
 	Context      string
 }
 
+// RawInstance records one scanner execution that reported an aggregated
+// finding.
 type RawInstance struct {
 	ScanUnitID  string `json:"scanUnitId"`
 	ExecutionID string `json:"executionId"`
 	Scanner     string `json:"scanner"`
 }
 
+// AggregatedFinding is one unique finding, by Fingerprint, merged from every
+// raw report of it across scan units.
 type AggregatedFinding struct {
 	Finding        *proto.Finding
 	Fingerprint    string
@@ -40,6 +47,26 @@ type AggregatedFinding struct {
 	RawInstances   []RawInstance
 }
 
+// SARIFProperties is the attribution attached to the finding's SARIF result.
+func (a *AggregatedFinding) SARIFProperties() map[string]interface{} {
+	properties := map[string]interface{}{
+		"fingerprint":    a.Fingerprint,
+		"rawCount":       a.RawCount,
+		"duplicateCount": a.DuplicateCount,
+		"targetIds":      a.TargetIDs,
+		"componentIds":   a.ComponentIDs,
+		"scanUnitIds":    a.ScanUnitIDs,
+		"relations":      a.Relations,
+		"context":        a.Contexts,
+	}
+	if len(a.RawInstances) > 0 {
+		properties["rawInstances"] = a.RawInstances
+	}
+	return properties
+}
+
+// Fingerprint identifies a finding independently of which scan unit reported
+// it: the same issue at the same repository-relative location hashes the same.
 func Fingerprint(repoRoot string, finding *proto.Finding) string {
 	if finding == nil {
 		return ""
@@ -68,6 +95,8 @@ func formatInt(value int32) string {
 	return strconv.FormatInt(int64(value), 10)
 }
 
+// Aggregate merges raw findings that share a Fingerprint, sorted by
+// fingerprint so the output is deterministic.
 func Aggregate(repoRoot string, inputs []AttributedFinding) []*AggregatedFinding {
 	byFingerprint := make(map[string]*AggregatedFinding)
 	for _, input := range inputs {
@@ -86,14 +115,10 @@ func Aggregate(repoRoot string, inputs []AttributedFinding) []*AggregatedFinding
 		agg.ScanUnitIDs = appendUnique(agg.ScanUnitIDs, input.ScanUnitID)
 		agg.Relations = appendUnique(agg.Relations, input.Relation)
 		agg.Contexts = appendUnique(agg.Contexts, input.Context)
-		scanner := ""
-		if input.Finding != nil {
-			scanner = input.Finding.Tool
-		}
 		agg.RawInstances = append(agg.RawInstances, RawInstance{
 			ScanUnitID:  input.ScanUnitID,
 			ExecutionID: input.ExecutionID,
-			Scanner:     scanner,
+			Scanner:     input.Finding.Tool,
 		})
 	}
 	result := make([]*AggregatedFinding, 0, len(byFingerprint))
@@ -126,77 +151,86 @@ func appendUnique(values []string, additions ...string) []string {
 	return values
 }
 
+// ContextForPath classifies a repository-relative path as production code or
+// one of the non-production contexts (test, docs, example, ...). It is the
+// single classification used everywhere a finding's context is computed
+// (targetresolve's file ownership calls it too).
+//
+// Only two things are read from the file name itself: a conventional project
+// document (README, LICENSE.md, SECURITY.rst, ...) is "docs", but only with no
+// extension or a documentation one -- security.go and history.ts are source
+// code. Every other tag applies to the path's DIRECTORY segments alone, so
+// src/test.go, src/build.go and src/tools.go are ordinary production files.
+// When several directories are tagged, the outermost one wins:
+// vendor/x/testing/y.go is vendored code, not the project's own tests.
 func ContextForPath(repoRelativePath string) string {
-	path := strings.ToLower(filepath.ToSlash(repoRelativePath))
-	base := filepath.Base(path)
-	ext := filepath.Ext(base)
-	stem := strings.TrimSuffix(base, ext)
-
-	for _, docStem := range []string{
-		"readme", "changelog", "changes", "contributing", "contributors",
-		"license", "licence", "notice", "authors", "troubleshooting",
-		"code_of_conduct", "code-of-conduct", "security", "history",
-	} {
-		if stem == docStem {
-			return "docs"
-		}
+	normalized := strings.ToLower(filepath.ToSlash(filepath.Clean(repoRelativePath)))
+	base := path.Base(normalized)
+	ext := path.Ext(base)
+	if documentationExtensions[ext] && documentationStems[strings.TrimSuffix(base, ext)] {
+		return "docs"
 	}
 
-	for _, tag := range contextDirectoryTags {
-		for _, part := range strings.Split(path, "/") {
-			if part == tag || strings.HasPrefix(part, tag+".") {
-				return contextDirectoryToLabel[tag]
-			}
+	dir := path.Dir(normalized)
+	if dir == "." || dir == "/" {
+		return "production"
+	}
+	for _, segment := range strings.Split(strings.Trim(dir, "/"), "/") {
+		if label, ok := contextDirectoryToLabel[segment]; ok {
+			return label
 		}
 	}
 	return "production"
 }
 
-var contextDirectoryTags = []string{
-	"generated",
-	"test", "tests", "__tests__", "testing", "testdata",
-	"fixture", "fixtures", "testfixtures",
-	"docs", "documentation", "doc",
-	"examples", "example", "samples",
-	".github", "ci", ".circleci", ".azure-pipelines",
-	"scripts", "script", "tools",
-	"deploy", "deployment", "infra", "terraform", "helm", "k8s",
-	"build",
-	"vendor", "third_party", "third-party", "external",
+// documentationStems are the conventional names of top-level project
+// documents; documentationExtensions are the extensions such a document
+// carries ("" for README, LICENSE, NOTICE, ...).
+var documentationStems = map[string]bool{
+	"readme": true, "changelog": true, "changes": true, "contributing": true, "contributors": true,
+	"license": true, "licence": true, "notice": true, "authors": true, "troubleshooting": true,
+	"code_of_conduct": true, "code-of-conduct": true, "security": true, "history": true,
 }
 
+var documentationExtensions = map[string]bool{
+	"": true, ".md": true, ".markdown": true, ".mdx": true, ".rst": true, ".txt": true,
+	".adoc": true, ".asciidoc": true, ".org": true, ".html": true,
+}
+
+// contextDirectoryToLabel maps a directory name to the context of everything
+// beneath it.
 var contextDirectoryToLabel = map[string]string{
-	"generated":          "generated",
-	"test":               "test",
-	"tests":              "test",
-	"__tests__":          "test",
-	"testing":            "test",
-	"testdata":           "test",
-	"fixture":            "fixture",
-	"fixtures":           "fixture",
-	"testfixtures":       "fixture",
-	"docs":               "docs",
-	"documentation":      "docs",
-	"doc":                "docs",
-	"examples":           "example",
-	"example":            "example",
-	"samples":            "example",
-	".github":            "ci",
-	"ci":                 "ci",
-	".circleci":          "ci",
-	".azure-pipelines":   "ci",
-	"scripts":            "build",
-	"script":             "build",
-	"tools":              "build",
-	"deploy":             "deployment",
-	"deployment":         "deployment",
-	"infra":              "deployment",
-	"terraform":          "deployment",
-	"helm":               "deployment",
-	"k8s":                "deployment",
-	"build":              "build",
-	"vendor":             "vendored",
-	"third_party":        "vendored",
-	"third-party":        "vendored",
-	"external":           "vendored",
+	"generated":        "generated",
+	"test":             "test",
+	"tests":            "test",
+	"__tests__":        "test",
+	"testing":          "test",
+	"testdata":         "test",
+	"fixture":          "fixture",
+	"fixtures":         "fixture",
+	"testfixtures":     "fixture",
+	"docs":             "docs",
+	"documentation":    "docs",
+	"doc":              "docs",
+	"examples":         "example",
+	"example":          "example",
+	"samples":          "example",
+	".github":          "ci",
+	"ci":               "ci",
+	".circleci":        "ci",
+	".azure-pipelines": "ci",
+	"scripts":          "build",
+	"script":           "build",
+	"tools":            "build",
+	"deploy":           "deployment",
+	"deployment":       "deployment",
+	"infra":            "deployment",
+	"terraform":        "deployment",
+	"helm":             "deployment",
+	"k8s":              "deployment",
+	"build":            "build",
+	"vendor":           "vendored",
+	"third_party":      "vendored",
+	"third-party":      "vendored",
+	"external":         "vendored",
 }

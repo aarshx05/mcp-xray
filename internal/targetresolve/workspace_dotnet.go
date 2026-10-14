@@ -73,8 +73,8 @@ func dotnetPackageReferencePrefix(doc *csprojFile, prefix string) bool {
 }
 
 // resolveDotnetLocalDeps fills in LocalDeps for every discovered .NET
-// project by resolving each ProjectReference Include path. Two real
-// complications were confirmed by reading an actual monorepo (see the plan):
+// project by resolving each ProjectReference Include path, which has two
+// complications:
 //
 //  1. MSBuild property expansion. $(RepoRoot) is a common convention
 //     (defined once, at the repo root, in Directory.Build.props as

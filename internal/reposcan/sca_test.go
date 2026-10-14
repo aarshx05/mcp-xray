@@ -18,10 +18,7 @@ func TestSplitScanRoots_NoExclusionsReturnsSingleRecursiveRoot(t *testing.T) {
 	mustMkdirAll(t, filepath.Join(root, "a"))
 	mustMkdirAll(t, filepath.Join(root, "b"))
 
-	recursive, shallow, err := splitScanRoots(root, &Config{Root: root})
-	if err != nil {
-		t.Fatalf("splitScanRoots returned error: %v", err)
-	}
+	recursive, shallow := splitScanRoots(root, &Config{Root: root})
 	if len(shallow) != 0 {
 		t.Errorf("expected no shallow roots when nothing is excluded, got %v", shallow)
 	}
@@ -38,10 +35,7 @@ func TestSplitScanRoots_FullyExcludedRootReturnsNothing(t *testing.T) {
 	// Root set one level up so that segment is actually below Root.
 	cfg := &Config{Root: filepath.Dir(root), ExcludedPaths: []string{filepath.Base(root)}}
 
-	recursive, shallow, err := splitScanRoots(root, cfg)
-	if err != nil {
-		t.Fatalf("splitScanRoots returned error: %v", err)
-	}
+	recursive, shallow := splitScanRoots(root, cfg)
 	if len(recursive) != 0 || len(shallow) != 0 {
 		t.Errorf("expected no roots at all when the root itself is excluded, got recursive=%v shallow=%v", recursive, shallow)
 	}
@@ -56,10 +50,7 @@ func TestSplitScanRoots_ExcludedChildProducesShallowRootPlusCleanSiblings(t *tes
 	mustMkdirAll(t, filepath.Join(root, "tools")) // parent of the excluded child
 
 	cfg := &Config{Root: root, ExcludedDirs: []string{"tools/other"}}
-	recursive, shallow, err := splitScanRoots(root, cfg)
-	if err != nil {
-		t.Fatalf("splitScanRoots returned error: %v", err)
-	}
+	recursive, shallow := splitScanRoots(root, cfg)
 
 	// root has an excluded descendant, so root itself must be a shallow
 	// root (its own direct files scanned non-recursively) rather than a
@@ -99,10 +90,7 @@ func TestSplitScanRoots_NestedExclusionTwoLevelsDeepIsPruned(t *testing.T) {
 	mustMkdirAll(t, good)
 
 	cfg := &Config{Root: root, ExcludedDirs: []string{"packages/bad/vendored"}}
-	recursive, shallow, err := splitScanRoots(root, cfg)
-	if err != nil {
-		t.Fatalf("splitScanRoots returned error: %v", err)
-	}
+	recursive, shallow := splitScanRoots(root, cfg)
 
 	bad := filepath.Join(root, "packages", "bad")
 	if !contains(shallow, bad) {
@@ -121,10 +109,7 @@ func TestSplitScanRoots_NestedExclusionTwoLevelsDeepIsPruned(t *testing.T) {
 
 func TestSplitScanRoots_UnreadableRootFallsBackToSingleEntry(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "does-not-exist")
-	recursive, shallow, err := splitScanRoots(root, &Config{Root: root})
-	if err != nil {
-		t.Fatalf("splitScanRoots returned error: %v", err)
-	}
+	recursive, shallow := splitScanRoots(root, &Config{Root: root})
 	if len(shallow) != 0 || len(recursive) != 1 || recursive[0] != root {
 		t.Errorf("expected an unreadable root to fall back to a single recursive entry (letting osv-scanner's own os.Stat report the real error), got recursive=%v shallow=%v", recursive, shallow)
 	}

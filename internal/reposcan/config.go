@@ -33,57 +33,71 @@ type Config struct {
 	CodeQLTimeoutSec int
 }
 
+// defaultExcludedDirs are dependency caches, build outputs and VCS/IDE
+// metadata: directories that never hold a repository's own source.
+var defaultExcludedDirs = []string{
+	".venv",
+	"venv",
+	"__pycache__",
+	".pytest_cache",
+	"node_modules",
+	".node_modules",
+	"vendor",
+	"target",
+	"dist",
+	"build",
+	".build",
+	"out",
+	".out",
+	"cache",
+	".cache",
+	"tmp",
+	".tmp",
+	"temp",
+	".temp",
+	".git",
+	".svn",
+	".hg",
+	".bzr",
+	".idea",
+	".vscode",
+	".vs",
+	".gradle",
+	".mvn",
+	"bin",
+	"obj",
+	".next",
+	".nuxt",
+	".turbo",
+	".yarn",
+	"coverage",
+	".coverage",
+	".nyc_output",
+	"*.egg-info",
+	".eggs",
+	".tox",
+}
+
+// defaultExcludedFiles are lockfiles: skipped by the SAST and secrets
+// scanners, while dependency scanning reads them.
+var defaultExcludedFiles = []string{
+	"go.sum",
+	"package-lock.json",
+	"yarn.lock",
+	"pnpm-lock.yaml",
+}
+
+// DefaultExcludedDirs returns the directory patterns every repository walk
+// skips by default.
+func DefaultExcludedDirs() []string {
+	return append([]string(nil), defaultExcludedDirs...)
+}
+
 // DefaultConfig returns a configuration with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		MaxFileSize: 10 * 1024 * 1024, // 10MB
-		ExcludedPaths: []string{
-			".venv",
-			"venv",
-			"__pycache__",
-			".pytest_cache",
-			"node_modules",
-			".node_modules",
-			"vendor",
-			"target",
-			"dist",
-			"build",
-			".build",
-			"out",
-			".out",
-			"cache",
-			".cache",
-			"tmp",
-			".tmp",
-			"temp",
-			".temp",
-			".git",
-			".svn",
-			".hg",
-			".bzr",
-			".idea",
-			".vscode",
-			".vs",
-			".gradle",
-			".mvn",
-			"bin",
-			"obj",
-			".next",
-			".nuxt",
-			".turbo",
-			".yarn",
-			"coverage",
-			".coverage",
-			".nyc_output",
-			"*.egg-info",
-			".eggs",
-			".tox",
-			"go.sum",
-			"package-lock.json",
-			"yarn.lock",
-			"pnpm-lock.yaml",
-			"pnpm-lock.yaml",
-		},
+		MaxFileSize:   10 * 1024 * 1024, // 10MB
+		ExcludedPaths: append(DefaultExcludedDirs(), defaultExcludedFiles...),
 	}
 }
 

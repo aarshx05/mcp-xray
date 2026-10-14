@@ -124,31 +124,17 @@ func includeTestDependents(primary *Project, alreadyIncluded map[*Project]bool, 
 	return added
 }
 
-// demoteReachableFallbackServers resolves a real ambiguity: a project
-// classified RoleMCPServer purely by a per-ecosystem source-signal heuristic
-// (signals.go) -- not confirmed by its own server.json registry manifest,
-// registry_manifest.go -- that is also reachable, via LocalDeps, from a
-// *different* RoleMCPServer project is almost certainly shared
-// infrastructure that other server depends on, not a standalone server of
-// its own. This is a confirmed real case, not a hypothetical: a shared
-// "core" library can genuinely contain the one real SDK construction call
-// in a repo, if every actual server calls a wrapper around it rather than
-// the SDK directly, making the library indistinguishable from a real server
-// by source signal alone.
+// demoteReachableFallbackServers demotes to RoleSharedLibrary a project that
+// is a server by source signal alone but that another server depends on: a
+// shared "core" library can hold a repository's only SDK construction call
+// when every server calls a wrapper around it, which makes it look like a
+// server.
 //
-// A project with RoleConfirmedByManifest == true is never demoted: an
-// authoritative, language-agnostic server.json is definitive regardless of
-// what else depends on it, or what it depends on.
-//
-// A project with its own hasOwnEntrypointEvidence (wrapper_classify.go --
-// a bin entry or a startup call in its own source) is also never demoted:
-// once wrapper_classify.go's promoteWrapperServers can create a second,
-// truly independent server that's also reachable from a first server (the
-// real twilio-labs/mcp shape -- @twilio-alpha/mcp depends on
-// @twilio-alpha/openapi-mcp-server, and the latter is *also* independently
-// a real server via its own separate bin/entrypoint), this rule would
-// otherwise incorrectly flatten the depended-upon one to
-// RoleSharedLibrary even though it's a genuine standalone server.
+// Two kinds of server are never demoted: one confirmed by its own
+// server.json (RoleConfirmedByManifest), and one with its own entrypoint
+// evidence (hasOwnEntrypointEvidence), which is a standalone server even
+// when another server also depends on it -- @twilio-alpha/mcp depends on
+// @twilio-alpha/openapi-mcp-server, which has a bin entry of its own.
 func demoteReachableFallbackServers(projects []*Project, byDir map[string]*Project) {
 	reachableFromAnotherServer := make(map[*Project]bool)
 
@@ -229,7 +215,7 @@ func mergeTargetsByComponent(targets []*Target) []*Target {
 				if includedSet[p] {
 					reason := other.IncludedReasons[filepath.Clean(p.Dir)]
 					existing := primary.IncludedReasons[filepath.Clean(p.Dir)]
-					if inclusionPriority(reason) > inclusionPriority(existing) {
+					if reason.rank() > existing.rank() {
 						primary.IncludedReasons[filepath.Clean(p.Dir)] = reason
 					}
 					continue
@@ -246,19 +232,6 @@ func mergeTargetsByComponent(targets []*Target) []*Target {
 		merged = append(merged, primary)
 	}
 	return merged
-}
-
-func inclusionPriority(r InclusionReason) int {
-	switch r {
-	case InclusionPrimary:
-		return 3
-	case InclusionSharedDependency:
-		return 2
-	case InclusionTestDependent:
-		return 1
-	default:
-		return 0
-	}
 }
 
 // transitiveClosure returns p plus every project reachable from p by

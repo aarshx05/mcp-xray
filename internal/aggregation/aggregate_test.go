@@ -30,15 +30,20 @@ func TestAggregateExactDuplicateKeepsAffectedTargets(t *testing.T) {
 
 func TestFingerprintSeparatesPackagesAndRegions(t *testing.T) {
 	root := t.TempDir()
-	base := &proto.Finding{Tool: "osv", Type: proto.FindingType_FINDING_TYPE_SCA, RuleId: "CVE-1", File: filepath.Join(root, "package-lock.json"), Package: "a", Version: "1", Message: "issue"}
-	otherPackage := *base
+	// Each variant is a fresh message: proto messages embed a mutex and must
+	// never be copied by value.
+	newFinding := func() *proto.Finding {
+		return &proto.Finding{Tool: "osv", Type: proto.FindingType_FINDING_TYPE_SCA, RuleId: "CVE-1", File: filepath.Join(root, "package-lock.json"), Package: "a", Version: "1", Message: "issue"}
+	}
+	base := newFinding()
+	otherPackage := newFinding()
 	otherPackage.Package = "b"
-	otherLine := *base
+	otherLine := newFinding()
 	otherLine.Line = 2
-	if Fingerprint(root, base) == Fingerprint(root, &otherPackage) {
+	if Fingerprint(root, base) == Fingerprint(root, otherPackage) {
 		t.Error("different package instances must not share a fingerprint")
 	}
-	if Fingerprint(root, base) == Fingerprint(root, &otherLine) {
+	if Fingerprint(root, base) == Fingerprint(root, otherLine) {
 		t.Error("different regions must not share a fingerprint")
 	}
 }
@@ -129,6 +134,47 @@ func TestContextForPath_DirectoryTags(t *testing.T) {
 	}
 }
 
+// Directory tags must never be applied to the file name itself: these are
+// ordinary production files that merely share a name with a tag.
+func TestContextForPath_FileNamesAreNotDirectoryTags(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"src/test.go", "production"},
+		{"src/build.go", "production"},
+		{"src/tools.go", "production"},
+		{"src/tools.ts", "production"},
+		{"test.py", "production"},
+		{"build", "production"},
+		{"cmd/build", "production"},
+		{"pkg/vendor.go", "production"},
+		{"tools/test.go", "build"},
+		{"internal/test/helpers.go", "test"},
+		{"docs/index.md", "docs"},
+		{"README.md", "docs"},
+		// Document names count only as documents, not as source files.
+		{"internal/auth/security.go", "production"},
+		{"src/history.ts", "production"},
+		{"pkg/notice.py", "production"},
+		{"server/changes.go", "production"},
+		{"src/license.rs", "production"},
+		{"SECURITY.md", "docs"},
+		{"LICENSE", "docs"},
+		{"pkg/CHANGELOG.rst", "docs"},
+		{"NOTICE.txt", "docs"},
+		// The outermost tagged directory decides.
+		{"vendor/github.com/x/testing/y.go", "vendored"},
+		{"scripts/docs/build.sh", "build"},
+		{"examples/tests/demo.py", "example"},
+	}
+	for _, tc := range cases {
+		if got := ContextForPath(tc.path); got != tc.want {
+			t.Errorf("ContextForPath(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestContextForPath_SameFileNeverTwoContexts(t *testing.T) {
 	path := "docs/README.md"
 	got := ContextForPath(path)
@@ -163,5 +209,32 @@ func TestAggregateCollectsAllRelationsAndContexts(t *testing.T) {
 	}
 	if len(items[0].Contexts) != 2 {
 		t.Errorf("contexts = %v, want [production test]", items[0].Contexts)
+	}
+}
+
+func TestSARIFProperties(t *testing.T) {
+	item := &AggregatedFinding{
+		Fingerprint:    "fp",
+		RawCount:       2,
+		DuplicateCount: 1,
+		TargetIDs:      []string{"t-a"},
+		ComponentIDs:   []string{"c-a"},
+		ScanUnitIDs:    []string{"scan-a"},
+		Relations:      []string{"direct"},
+		Contexts:       []string{"production"},
+	}
+	properties := item.SARIFProperties()
+	for _, key := range []string{"fingerprint", "rawCount", "duplicateCount", "targetIds", "componentIds", "scanUnitIds", "relations", "context"} {
+		if _, ok := properties[key]; !ok {
+			t.Errorf("SARIFProperties() lacks %q: %v", key, properties)
+		}
+	}
+	if _, ok := properties["rawInstances"]; ok {
+		t.Error("rawInstances is set although the finding has none")
+	}
+
+	item.RawInstances = []RawInstance{{ScanUnitID: "scan-a", ExecutionID: "exec-1", Scanner: "sast"}}
+	if instances, ok := item.SARIFProperties()["rawInstances"].([]RawInstance); !ok || len(instances) != 1 {
+		t.Errorf("rawInstances = %v, want the one raw instance", item.SARIFProperties()["rawInstances"])
 	}
 }

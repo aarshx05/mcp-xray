@@ -29,6 +29,23 @@ func repoRelative(repoRoot, path string) string {
 	return filepath.ToSlash(filepath.Clean(rel))
 }
 
+// projectRepoRoot recovers the repository root p was discovered under from
+// p.Dir and p.RelDir (Dir is always the root joined with RelDir), for the few
+// classification steps that must not look outside the repository. ok is
+// false when RelDir is unknown.
+func projectRepoRoot(p *Project) (root string, ok bool) {
+	if p.RelDir == "" {
+		return "", false
+	}
+	root = filepath.Clean(p.Dir)
+	if p.RelDir != "." {
+		for range strings.Split(p.RelDir, "/") {
+			root = filepath.Dir(root)
+		}
+	}
+	return root, true
+}
+
 // assignIdentities attaches stable project/component/target identities and
 // converts dependency edges to the stable-ID representation. It is called
 // only after all discovery and registry promotion is complete.
@@ -48,6 +65,13 @@ func assignIdentities(repoRoot string, projects []*Project) []*Component {
 			p.OwnershipRoot, p.OwnershipEvidence, p.OwnershipAmbiguous = inferOwnershipRoot(repoRoot, p)
 		}
 		p.ComponentID = stableID("component", repoRelative(repoRoot, p.OwnershipRoot))
+	}
+
+	// Edges are converted only once EVERY project has its ID: a dependency
+	// later in the slice would otherwise contribute an empty ID, and
+	// transitiveClosure, which trusts LocalDepIDs whenever any of them
+	// resolves, would silently drop that dependency from the target's scope.
+	for _, p := range projects {
 		p.LocalDepIDs = p.LocalDepIDs[:0]
 		for _, depDir := range p.LocalDeps {
 			for _, dep := range byDir[filepath.Clean(depDir)] {
@@ -190,11 +214,7 @@ func ResolutionJSON(r *Resolution) ([]byte, error) {
 		if p.ManifestPath != "" {
 			manifest = repoRelative(r.RepoRoot, p.ManifestPath)
 		}
-		root := p.OwnershipRoot
-		if root == "" {
-			root = p.Dir
-		}
-		view.Projects = append(view.Projects, projectView{ID: p.ID, Name: p.Name, Path: repoRelative(r.RepoRoot, p.Dir), ManifestPath: manifest, Ecosystem: p.Ecosystem, Role: p.Role, OwnershipRoot: repoRelative(r.RepoRoot, root), OwnershipEvidence: p.OwnershipEvidence, OwnershipAmbiguous: p.OwnershipAmbiguous, LocalDepIDs: p.LocalDepIDs, ComponentID: p.ComponentID, Evidence: p.Evidence})
+		view.Projects = append(view.Projects, projectView{ID: p.ID, Name: p.Name, Path: repoRelative(r.RepoRoot, p.Dir), ManifestPath: manifest, Ecosystem: p.Ecosystem, Role: p.Role, OwnershipRoot: repoRelative(r.RepoRoot, p.ScanRoot()), OwnershipEvidence: p.OwnershipEvidence, OwnershipAmbiguous: p.OwnershipAmbiguous, LocalDepIDs: p.LocalDepIDs, ComponentID: p.ComponentID, Evidence: p.Evidence})
 	}
 	for _, c := range r.Components {
 		view.Components = append(view.Components, componentView{ID: c.ID, Root: repoRelative(r.RepoRoot, c.Root), ProjectIDs: c.ProjectIDs, Evidence: c.Evidence, Ambiguous: c.Ambiguous})

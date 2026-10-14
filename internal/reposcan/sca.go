@@ -21,6 +21,7 @@ import (
 // dependency input understood by OSV from an actual scanner failure.
 var ErrUnsupportedInput = errors.New("unsupported SCA input")
 
+// IsUnsupportedScanError reports whether err means there was nothing to scan.
 func IsUnsupportedScanError(err error) bool { return errors.Is(err, ErrUnsupportedInput) }
 
 type SCAScanner struct {
@@ -36,10 +37,7 @@ func NewSCAScanner(repoPath string, config *Config) *SCAScanner {
 }
 
 func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
-	recursiveRoots, shallowRoots, err := splitScanRoots(s.repoPath, s.config)
-	if err != nil {
-		return nil, fmt.Errorf("osv scan failed to enumerate scan roots: %w", err)
-	}
+	recursiveRoots, shallowRoots := splitScanRoots(s.repoPath, s.config)
 
 	var combined models.VulnerabilityResults
 	calls, unsupported := 0, 0
@@ -54,13 +52,8 @@ func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 			return nil
 		}
 		if isUnsupportedOSVInput(callErr) {
-			// A directory with nothing OSV understands (e.g. a pure
-			// container directory with no manifest of its own) is expected
-			// once a scan is split across several roots -- most roots won't
-			// have a manifest directly inside them. Only surfaced as
-			// ErrUnsupportedInput below if EVERY group reports it, matching
-			// the original single-call behavior where it meant the whole
-			// input had nothing OSV could scan.
+			// Many split roots hold no manifest of their own; the scan as a
+			// whole is unsupported only when every group says so.
 			unsupported++
 			return nil
 		}
@@ -68,12 +61,8 @@ func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 		return fmt.Errorf("osv scan failed: %w", callErr)
 	}
 
-	// Two groups because osv-scanner's Recursive flag applies to an entire
-	// ScannerActions call, not per-path: a directory with an excluded
-	// subdirectory can't be scanned recursively (that would pull the
-	// exclusion back in) but must still have its own direct files covered,
-	// so it is scanned non-recursively here while its clean children are
-	// scanned recursively in the other group.
+	// Two calls, because osv-scanner's Recursive flag applies to a whole
+	// call rather than to each path (see splitScanRoots).
 	if err := scanGroup(recursiveRoots, true); err != nil {
 		return nil, err
 	}
@@ -94,14 +83,10 @@ func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 	return findings, nil
 }
 
-// ScanRootOwnFiles runs SCA over exactly root's own direct files, with no
-// recursion into any subdirectory. It exists for the workspace-root
-// dependency fallback (targetresolve.ScanUnit.FallbackLockfiles): a target
-// whose own scan scope has no lockfile of its own can still have its
-// dependencies checked against a lockfile that lives at the repository root
-// (e.g. an npm/yarn/pnpm or Cargo workspace's shared lockfile), without
-// re-scanning any other target's own directory or turning into a broader
-// repo-wide scan.
+// ScanRootOwnFiles runs SCA over root's own files, without descending into
+// any subdirectory. It checks a workspace's shared root lockfile for targets
+// that have none of their own, without rescanning other targets'
+// directories.
 func ScanRootOwnFiles(root string) ([]*proto.Finding, error) {
 	results, err := runOSVScan([]string{root}, false)
 	if err != nil {
@@ -113,13 +98,9 @@ func ScanRootOwnFiles(root string) ([]*proto.Finding, error) {
 	return FromOSV(results), nil
 }
 
-// runOSVScan invokes osv-scanner over dirs and treats
-// osvscanner.ErrVulnerabilitiesFound as success: DoScan computes it from the
-// already-populated results purely to signal "there's something here" (the
-// same convention the osv-scanner CLI uses via exit code 1), returning it
-// alongside the real, valid results. Treating it as fatal would discard
-// every genuine finding and abort the scan on the one input a security
-// scanner exists to catch.
+// runOSVScan invokes osv-scanner over dirs. osvscanner.ErrVulnerabilitiesFound
+// is success: DoScan returns it alongside complete results whenever it
+// finds a vulnerability (the CLI's exit code 1).
 func runOSVScan(dirs []string, recursive bool) (models.VulnerabilityResults, error) {
 	results, err := osvscanner.DoScan(osvscanner.ScannerActions{
 		DirectoryPaths: dirs,
@@ -139,33 +120,24 @@ func isUnsupportedOSVInput(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no packages found in scan")
 }
 
-// splitScanRoots partitions root into the directory paths osv-scanner should
-// be given so that cfg.ExcludedDirs is actually honored -- osv-scanner has no
-// "recurse except these subdirectories" option, so exclusion has to happen
-// at the directory-selection level instead, exactly like SASTScanner and
-// SecretsScanner already exclude via cfg.ShouldExclude during their own
-// filepath.Walk. This never tries to enumerate manifest/lockfile files
-// itself (that list is necessarily incomplete -- see the comment on
-// manifestAndLockfilePatterns in targetresolve); it only ever decides
-// directory BOUNDARIES, and osv-scanner still does its own full,
-// ecosystem-agnostic extractor walk inside every directory it's handed.
+// splitScanRoots picks the directories to hand osv-scanner so that cfg's
+// exclusions are honored: osv-scanner cannot recurse "except these
+// subdirectories", so exclusion happens by choosing directories, the way the
+// SAST and secrets scanners skip excluded paths during their walk. Which
+// files are manifests is left entirely to osv-scanner.
 //
-// recursiveRoots are subtrees with no exclusion anywhere inside them, safe
-// to scan with Recursive:true as a single unit. shallowRoots are directories
-// that contain an excluded child: their own direct files must still be
-// scanned (a workspace's root manifest, say), but only non-recursively,
-// since a recursive scan of the directory itself would pull the excluded
-// child back in. Each excluded child's non-excluded siblings are evaluated
-// independently and may themselves land in either list.
-func splitScanRoots(root string, cfg *Config) (recursiveRoots, shallowRoots []string, err error) {
+// recursiveRoots are subtrees with no exclusion anywhere inside them.
+// shallowRoots are directories with an excluded descendant: their own files
+// (a workspace's root manifest, say) are scanned non-recursively, since a
+// recursive scan would pull the excluded descendant back in.
+func splitScanRoots(root string, cfg *Config) (recursiveRoots, shallowRoots []string) {
 	if cfg.ShouldExclude(root) {
-		return nil, nil, nil
+		return nil, nil
 	}
-	entries, readErr := os.ReadDir(root)
-	if readErr != nil {
-		// Root itself is unreadable/not a directory: let osv-scanner's own
-		// os.Stat surface the real error rather than masking it here.
-		return []string{root}, nil, nil
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		// Let osv-scanner report why root cannot be read.
+		return []string{root}, nil
 	}
 
 	var childDirs []string
@@ -182,35 +154,19 @@ func splitScanRoots(root string, cfg *Config) (recursiveRoots, shallowRoots []st
 		childDirs = append(childDirs, child)
 	}
 
-	// Recurse into every surviving child first: an exclusion arbitrarily
-	// deep inside an otherwise-unremarkable child still means root can't be
-	// scanned as one clean recursive unit, so this has to be known before
-	// root's own case can be decided -- checking only root's immediate
-	// children would miss any exclusion below the first level.
+	// An exclusion at any depth below a child decides root's case too.
 	for _, child := range childDirs {
-		childRecursive, childShallow, err := splitScanRoots(child, cfg)
-		if err != nil {
-			return nil, nil, err
-		}
+		childRecursive, childShallow := splitScanRoots(child, cfg)
 		recursiveRoots = append(recursiveRoots, childRecursive...)
 		shallowRoots = append(shallowRoots, childShallow...)
 	}
 
 	if !directlyPruned && len(shallowRoots) == 0 {
-		// No exclusion directly among root's children, and the recursion
-		// above found none deeper either: root is one clean subtree, and
-		// whatever accumulated into recursiveRoots so far (nothing, since a
-		// clean child always returns itself alone) is moot -- discard it in
-		// favor of the single, cheaper root entry.
-		return []string{root}, nil, nil
+		// Nothing below root is excluded: scan it as one subtree.
+		return []string{root}, nil
 	}
-
-	// An exclusion exists somewhere under root (directly, or discovered by
-	// the recursion above). root's own direct files -- if any -- still need
-	// to be scanned, but only non-recursively: a recursive entry for root
-	// itself would pull the exclusion straight back in.
 	shallowRoots = append(shallowRoots, root)
-	return recursiveRoots, shallowRoots, nil
+	return recursiveRoots, shallowRoots
 }
 
 // severityFromScore maps CVSS base score => unified bucket.

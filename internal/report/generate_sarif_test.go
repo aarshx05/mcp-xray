@@ -2,7 +2,6 @@ package report
 
 import (
 	"encoding/json"
-	"fmt"
 	"testing"
 
 	"mcpxray/proto"
@@ -60,79 +59,6 @@ func TestGenerateSarif_RulesSortedByID(t *testing.T) {
 	}
 }
 
-// TestGenerateSarifForTarget_TagsRelationsIncludingTestDependent covers all
-// four targetRelation values GenerateSarifForTarget can produce, including
-// the new "test-dependent" value for a finding inside a project included via
-// targetresolve.InclusionTestDependent (internal/targetresolve/graph.go's
-// includeTestDependents).
-func TestGenerateSarifForTarget_TagsRelationsIncludingTestDependent(t *testing.T) {
-	findings := []*proto.Finding{
-		{RuleId: "r1", Title: "direct finding", File: "/repo/server/main.go"},
-		{RuleId: "r2", Title: "shared finding", File: "/repo/shared/util.go"},
-		{RuleId: "r3", Title: "test-dependent finding", File: "/repo/tests/server.tests/index.test.js"},
-		{RuleId: "r4", Title: "repo-level finding", File: "/repo/README.md"},
-		{RuleId: "r5", Title: "no file at all"},
-	}
-	reasons := map[string]string{
-		"/repo/shared":             "shared-dependency",
-		"/repo/tests/server.tests": "test-dependent",
-	}
-
-	out, err := GenerateSarifForTarget(findings, "/repo/server", []string{"/repo/server", "/repo/shared", "/repo/tests/server.tests"}, reasons)
-	if err != nil {
-		t.Fatalf("GenerateSarifForTarget returned error: %v", err)
-	}
-
-	var parsed SARIFReport
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal SARIF output: %v", err)
-	}
-
-	relationByRule := make(map[string]string)
-	for _, r := range parsed.Runs[0].Results {
-		relationByRule[r.RuleID] = fmt.Sprintf("%v", r.Properties["targetRelation"])
-	}
-
-	want := map[string]string{
-		"r1": "direct",
-		"r2": "shared-dependency",
-		"r3": "test-dependent",
-		"r4": "repo-level",
-		"r5": "repo-level",
-	}
-	for rule, expected := range want {
-		if got := relationByRule[rule]; got != expected {
-			t.Errorf("rule %s: expected targetRelation %q, got %q", rule, expected, got)
-		}
-	}
-}
-
-// TestGenerateSarifForTarget_NilReasonsDegradesToSharedDependency locks in
-// backward compatibility: a nil/empty reasons map (the pre-this-phase call
-// shape) must behave exactly as before -- every included root other than
-// primaryRoot reports "shared-dependency".
-func TestGenerateSarifForTarget_NilReasonsDegradesToSharedDependency(t *testing.T) {
-	findings := []*proto.Finding{
-		{RuleId: "r1", Title: "shared finding", File: "/repo/shared/util.go"},
-	}
-	out, err := GenerateSarifForTarget(findings, "/repo/server", []string{"/repo/server", "/repo/shared"}, nil)
-	if err != nil {
-		t.Fatalf("GenerateSarifForTarget returned error: %v", err)
-	}
-	var parsed SARIFReport
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal SARIF output: %v", err)
-	}
-	got := fmt.Sprintf("%v", parsed.Runs[0].Results[0].Properties["targetRelation"])
-	if got != "shared-dependency" {
-		t.Errorf("expected nil reasons to degrade to shared-dependency, got %q", got)
-	}
-}
-
-// TestGenerateSarif_DoesNotMutateCallerSlice guards against GenerateSarif
-// reordering the caller's findings slice in place as a side effect. Callers
-// (e.g. the pentest flow) reuse the same slice immediately after calling
-// this function and must see it in the order they passed it in.
 func TestGenerateSarif_DoesNotMutateCallerSlice(t *testing.T) {
 	findings := sampleFindings()
 
@@ -279,13 +205,9 @@ func TestGenerateSarifWithProperties_PerFindingProperties(t *testing.T) {
 	}
 }
 
-// TestGenerateSarifWithProperties_PropertiesStayWithTheirFinding is the
-// regression test for the bug where generateSarifWithProperties sorted
-// findings by severity but indexed the parallel "additional" per-finding
-// property slice by post-sort position, silently attaching one finding's
-// fingerprint/targetIds/etc. to a different finding whenever severities
-// differ. additional[i] must always describe findings[i], regardless of
-// where findings[i] ends up in the output after severity sorting.
+// TestGenerateSarifWithProperties_PropertiesStayWithTheirFinding: properties[i]
+// describes findings[i] wherever severity sorting moves findings[i] in the
+// output.
 func TestGenerateSarifWithProperties_PropertiesStayWithTheirFinding(t *testing.T) {
 	findings := []*proto.Finding{
 		{RuleId: "low-rule", Severity: proto.RiskSeverity_RISK_SEVERITY_LOW, File: "low.go"},
@@ -359,7 +281,7 @@ func TestGenerateSarifWithProperties_EqualSeverityKeepsOriginalOrder(t *testing.
 	}
 }
 
-func TestGenerateSarif_LegacyPathNoRunProperties(t *testing.T) {
+func TestGenerateSarif_NoRunProperties(t *testing.T) {
 	out, err := GenerateSarif(sampleFindings())
 	if err != nil {
 		t.Fatalf("error: %v", err)

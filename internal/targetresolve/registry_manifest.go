@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"mcpxray/internal/reposcan"
 )
 
 // registryManifestHit is one directory confirmed, via a valid server.json,
@@ -70,30 +68,13 @@ func registryManifestDisplayName(doc map[string]interface{}, dir string) (string
 	return filepath.Base(dir), false
 }
 
-// discoverRegistryManifests walks repoRoot looking for valid server.json
-// files, reusing reposcan's default exclude list for pruning exactly like
-// discoverProjects does.
+// discoverRegistryManifests returns every valid server.json under repoRoot.
 func discoverRegistryManifests(repoRoot string) ([]registryManifestHit, error) {
-	prune := &reposcan.Config{
-		Root:          repoRoot,
-		ExcludedPaths: reposcan.DefaultConfig().ExcludedPaths,
-	}
-
 	var hits []registryManifestHit
-	err := filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+	err := walkFiles(repoRoot, nil, func(path string, info os.FileInfo) error {
+		if strings.ToLower(info.Name()) != "server.json" {
 			return nil
 		}
-		if prune.ShouldExclude(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() || strings.ToLower(info.Name()) != "server.json" {
-			return nil
-		}
-
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
@@ -102,18 +83,14 @@ func discoverRegistryManifests(repoRoot string) ([]registryManifestHit, error) {
 		if err := json.Unmarshal(data, &doc); err != nil || !isValidRegistryManifest(doc) {
 			return nil
 		}
-
 		dir := filepath.Dir(path)
 		name, confirmed := registryManifestDisplayName(doc, dir)
-		hasLocalPackages := false
-		if arr, ok := doc["packages"].([]interface{}); ok && len(arr) > 0 {
-			hasLocalPackages = true
-		}
+		packages, _ := doc["packages"].([]interface{})
 		hits = append(hits, registryManifestHit{
 			Dir:              dir,
 			Name:             name,
 			NameConfirmed:    confirmed,
-			HasLocalPackages: hasLocalPackages,
+			HasLocalPackages: len(packages) > 0,
 		})
 		return nil
 	})
@@ -123,15 +100,12 @@ func discoverRegistryManifests(repoRoot string) ([]registryManifestHit, error) {
 	return hits, nil
 }
 
-// applyRegistryManifestSignals is the universal, language-agnostic Tier 1
-// signal: a directory with a valid server.json is authoritatively an MCP
-// server, regardless of implementation language and regardless of whatever
-// a per-ecosystem source-code heuristic (signals.go) might otherwise have
-// concluded about it. For a directory where an ecosystem manifest was
-// already discovered (go.mod/package.json/pyproject.toml/.csproj), this
-// overrides that Project's Role. For a directory with no recognized
-// ecosystem manifest at all (e.g. a language this package has no parser
-// for), it synthesizes a minimal Project so the server is still found.
+// applyRegistryManifestSignals applies the authoritative, language-agnostic
+// signal: a directory with a valid server.json is an MCP server, whatever
+// the source heuristics in signals.go concluded. It overrides the Role of
+// the project in that directory (or of its one non-test descendant
+// project), and synthesizes a minimal Project where there is none, so a
+// server in a language without a manifest parser is still found.
 func applyRegistryManifestSignals(repoRoot string, projects []*Project) ([]*Project, error) {
 	hits, err := discoverRegistryManifests(repoRoot)
 	if err != nil {
@@ -170,20 +144,12 @@ func applyRegistryManifestSignals(repoRoot string, projects []*Project) ([]*Proj
 			continue
 		}
 
-		// No project exists at the exact hit directory. Before
-		// synthesizing a new one, search for an existing project whose
-		// directory is a DESCENDANT of hit.Dir -- a real repo shape
-		// (confirmed in microsoft/mcp) has server.json sitting one or more
-		// directories ABOVE the actual manifest (e.g.
-		// servers/Foo.Mcp.Server/server.json vs. the real .csproj at
-		// servers/Foo.Mcp.Server/src/Foo.Mcp.Server.csproj). Upgrading the
-		// real, already-discovered nested project instead of synthesizing
-		// a duplicate handles any nesting depth generically. Test-shaped
-		// descendants (isTestShapedProject) are excluded as candidates --
-		// a server.json describing a server must never be attributed to
-		// that server's own test project. When the search finds zero or
-		// more than one non-test-shaped candidate, fall back to today's
-		// synthesize behavior (an ambiguous match is not a safe upgrade).
+		// server.json may sit directories above the manifest it describes
+		// (servers/Foo/server.json for servers/Foo/src/Foo.csproj), so the
+		// one non-test-shaped project below it is upgraded rather than
+		// duplicated. Zero or several candidates fall back to synthesizing
+		// a project: an ambiguous match is not a safe upgrade, and a
+		// server's own test project must never take its server.json.
 		if candidate := findUnambiguousDescendantProject(dir, projects); candidate != nil {
 			candidate.Role = role
 			candidate.RoleConfirmedByManifest = roleConfirmed
@@ -197,6 +163,7 @@ func applyRegistryManifestSignals(repoRoot string, projects []*Project) ([]*Proj
 		synthesized := &Project{
 			Name:                    hit.Name,
 			Dir:                     hit.Dir,
+			RelDir:                  repoRelative(repoRoot, hit.Dir),
 			Ecosystem:               "unknown",
 			Role:                    role,
 			RoleConfirmedByManifest: roleConfirmed,

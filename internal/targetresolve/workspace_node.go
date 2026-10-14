@@ -115,8 +115,11 @@ func binNameFromPackageName(name string) string {
 // package manager expresses "use my workspace sibling, not the registry":
 //
 //   - the pnpm/yarn/npm "workspace:" protocol (e.g. "workspace:*"), where the
-//     dependency KEY is the sibling package's declared "name" -- resolved by
-//     matching against every other discovered Node project's Name.
+//     dependency KEY is normally the sibling package's declared "name" --
+//     resolved by matching against every other discovered Node project's
+//     Name -- unless the spec itself names the sibling, as an alias
+//     ("workspace:real-pkg@*") or a relative path ("workspace:../real-pkg");
+//     see resolveNodeWorkspaceDep.
 //   - the "file:"/"link:" protocol, where the VALUE is a relative filesystem
 //     path from this project's directory -- resolved directly against
 //     discovered projects' directories.
@@ -131,9 +134,6 @@ func binNameFromPackageName(name string) string {
 // which edges get resolved. A package.json that only declares "workspaces"
 // and nothing else is simply classified RoleUnrelated by signals.go, same as
 // any other project with no MCP signal -- no special-casing required.
-// (workspace_registry.go's discoverPnpmWorkspace/discoverLernaWorkspace/etc.
-// still parse these glob fields, but purely for naming/observability
-// metadata -- not for edge resolution, which is entirely handled here.)
 func resolveNodeLocalDeps(projects []*Project) {
 	byName := make(map[string]*Project)
 	byDir := make(map[string]*Project)
@@ -160,7 +160,7 @@ func resolveNodeLocalDeps(projects []*Project) {
 		for depName, depValue := range pkg.allDependencies() {
 			switch {
 			case strings.HasPrefix(depValue, "workspace:"):
-				if dep, ok := byName[depName]; ok && dep != p {
+				if dep := resolveNodeWorkspaceDep(p, depName, strings.TrimPrefix(depValue, "workspace:"), byName, byDir); dep != nil {
 					addLocalDep(p, dep.Dir)
 				}
 			case strings.HasPrefix(depValue, "file:"):
@@ -168,24 +168,13 @@ func resolveNodeLocalDeps(projects []*Project) {
 			case strings.HasPrefix(depValue, "link:"):
 				resolveNodePathDep(p, byDir, strings.TrimPrefix(depValue, "link:"))
 			default:
-				// A plain registry-version-shaped dependency whose KEY
-				// exactly matches another discovered Node project's own
-				// declared name in this repo is treated as workspace-local
-				// -- mirroring resolveGoLocalDeps' precedent (a `require`
-				// entry matching a known local module path needs no
-				// `replace` directive at all). Required for real repos like
-				// twilio-labs/mcp, whose @twilio-alpha/mcp depends on its
-				// sibling via "@twilio-alpha/openapi-mcp-server": "0.7.0" --
-				// a plain semver string, no workspace:/file:/link: protocol
-				// at all -- which would otherwise create no LocalDeps edge
-				// even though the dependency is genuinely local.
-				//
-				// Accepted tradeoff (same one Go already accepts): an
-				// unrelated local package that happens to share a name with
-				// a normal registry dependency of some other project would
-				// spuriously gain an edge here. Not solvable without a
-				// registry lookup to disambiguate "is this really the
-				// npm-published foo, or my local foo?" -- out of scope.
+				// A plain version ("@twilio-alpha/openapi-mcp-server":
+				// "0.7.0") on a package another project in this repository
+				// declares is workspace-local: npm, yarn and pnpm
+				// workspaces link it to the sibling. As with Go module
+				// paths, a published package that shares a local package's
+				// name would be mistaken for it; telling them apart needs a
+				// registry lookup.
 				if looksLikeRegistryVersionSpecifier(depValue) {
 					if dep, ok := byName[depName]; ok && dep != p {
 						addLocalDep(p, dep.Dir)
@@ -194,6 +183,40 @@ func resolveNodeLocalDeps(projects []*Project) {
 			}
 		}
 	}
+}
+
+// resolveNodeWorkspaceDep returns the sibling project a "workspace:"
+// dependency refers to, or nil. Only the plain form ("workspace:*",
+// "workspace:^1.2.0") names the sibling by the dependency KEY; the spec after
+// the protocol can instead name it directly, and is then the only thing that
+// counts:
+//
+//   - a relative path ("workspace:../real-pkg", "workspace:./libs/x"),
+//     resolved against the depending project's own directory;
+//   - an alias ("workspace:real-pkg@*", "workspace:@scope/real-pkg@^1"),
+//     where the key is only the local import name.
+//
+// The key is never consulted for those two forms: it is just an alias, so a
+// path or alias naming a project this resolver did not discover must not be
+// "rescued" by an unrelated project that happens to share the alias name.
+func resolveNodeWorkspaceDep(p *Project, depName, spec string, byName, byDir map[string]*Project) *Project {
+	target := depName
+	if spec == "." || spec == ".." || strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+		dep := byDir[filepath.Clean(filepath.Join(p.Dir, filepath.FromSlash(spec)))]
+		if dep == p {
+			return nil
+		}
+		return dep
+	}
+	if at := strings.LastIndex(spec, "@"); at > 0 {
+		// at > 0, not >= 0: a leading "@" is a package scope, not the
+		// alias/version separator.
+		target = spec[:at]
+	}
+	if dep, ok := byName[target]; ok && dep != p {
+		return dep
+	}
+	return nil
 }
 
 // looksLikeRegistryVersionSpecifier excludes dependency values that are

@@ -119,3 +119,41 @@ func TestAssignIdentities_ValidServerJSONStillMergesSiblingProjects(t *testing.T
 		t.Errorf("expected ownership root to be promoted to the valid server.json's directory %q, got %q", componentDir, server.OwnershipRoot)
 	}
 }
+
+// Discovery walks the tree in lexical order, so a server's dependencies can
+// be discovered both before (a-lib) and after (z-lib) the server itself.
+// Every dependency must get its real stable ID: transitiveClosure trusts
+// LocalDepIDs whenever any of them resolves, so a single empty ID used to
+// drop z-lib from the target's scope while a-lib kept it looking healthy.
+func TestResolve_DependencyDiscoveredAfterItsDependentStaysInScope(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{
+		"name": "server",
+		"dependencies": {"@modelcontextprotocol/sdk": "^1", "a-lib": "workspace:*", "z-lib": "workspace:*"}
+	}`)
+	writeFile(t, filepath.Join(root, "index.js"), `const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js"); new McpServer();`)
+	writeFile(t, filepath.Join(root, "a-lib", "package.json"), `{"name": "a-lib"}`)
+	writeFile(t, filepath.Join(root, "z-lib", "package.json"), `{"name": "z-lib"}`)
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range resolution.Projects {
+		for _, id := range p.LocalDepIDs {
+			if id == "" {
+				t.Errorf("project %s has an empty LocalDepIDs entry: %v", p.Name, p.LocalDepIDs)
+			}
+		}
+	}
+	if len(resolution.Targets) != 1 {
+		t.Fatalf("targets = %d, want 1", len(resolution.Targets))
+	}
+	included := map[string]bool{}
+	for _, p := range resolution.Targets[0].Included {
+		included[p.Name] = true
+	}
+	if !included["a-lib"] || !included["z-lib"] {
+		t.Errorf("target scope = %v, want both a-lib and z-lib included", included)
+	}
+}

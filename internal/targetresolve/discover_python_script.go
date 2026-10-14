@@ -4,50 +4,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"mcpxray/internal/reposcan"
 )
 
-// discoverLegacyPythonScripts walks repoRoot (same reposcan-exclude pruning
-// as discoverProjects) looking for a standalone .py file with no enclosing
-// pyproject.toml/setup.py, that at least textually mentions fastmcp or
-// mcp.server/mcp.client (a cheap prefilter -- discovery finds candidates,
-// classifyPythonScriptProject decides Role, the same discovery/
-// classification separation this package already uses everywhere else).
-// Reflects a real repo, oracle/mcp's dbtools-mcp-server.py, which has no
-// pyproject.toml/setup.py anywhere in its directory tree at all -- just a
-// README.md and requirements.txt alongside the script.
+// discoverLegacyPythonScripts finds standalone .py files with no enclosing
+// pyproject.toml or setup.py that at least mention fastmcp or
+// mcp.server/mcp.client -- a cheap prefilter; classifyPythonScriptProject
+// decides the role. Some real servers ship as a bare script next to a
+// requirements.txt, with no Python manifest at all.
 func discoverLegacyPythonScripts(repoRoot string) ([]*Project, error) {
-	prune := &reposcan.Config{Root: repoRoot, ExcludedPaths: reposcan.DefaultConfig().ExcludedPaths}
-
 	var candidates []*Project
-	err := filepath.Walk(repoRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+	err := walkFiles(repoRoot, nil, func(path string, info os.FileInfo) error {
+		if !strings.HasSuffix(info.Name(), ".py") {
 			return nil
 		}
-		if prune.ShouldExclude(path) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info.IsDir() || !strings.HasSuffix(info.Name(), ".py") {
-			return nil
-		}
-
 		dir := filepath.Dir(path)
 		if hasEnclosingPythonManifest(dir, repoRoot) {
 			return nil
 		}
-
 		data, err := os.ReadFile(path)
 		if err != nil || !legacyPythonScriptPrefilterPattern.Match(data) {
 			return nil
 		}
-
 		candidates = append(candidates, &Project{
 			Name:         strings.TrimSuffix(info.Name(), ".py"),
 			Dir:          dir,
+			RelDir:       repoRelative(repoRoot, dir),
 			Ecosystem:    "python-script",
 			ManifestPath: path, // the script itself; there is no manifest
 		})

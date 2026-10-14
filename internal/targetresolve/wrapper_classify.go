@@ -36,17 +36,12 @@ func hasOwnEntrypointEvidence(p *Project, allProjects []*Project) bool {
 // server-construction call lives in a dependency, not in this project's
 // own source (a "wrapper" or "composed" server).
 //
-// Reproduces twilio-labs/mcp exactly: @twilio-alpha/mcp has its own "bin"
-// entry and a `.connect(transport)` call, but its own source only
-// instantiates a workspace-local class (extends a base class defined in a
-// sibling package); the genuine `new Server(...)` call lives in
-// @twilio-alpha/openapi-mcp-server, which it depends on via a plain-version
-// dependency (see workspace_node.go's resolveNodeLocalDeps).
+// For example, @twilio-alpha/mcp has a "bin" entry and a
+// `.connect(transport)` call, but the `new Server(...)` call lives in the
+// sibling @twilio-alpha/openapi-mcp-server it depends on.
 //
-// Test-shaped projects (isTestShapedProject, signals.go) are never
-// promoted, for the same reason they're never classified RoleMCPServer by
-// classifyProject: a test harness that happens to construct or reach a real
-// server is not itself a standalone target.
+// Test-shaped projects (isTestShapedProject) are never promoted: a test
+// harness that reaches a real server is not a standalone target.
 //
 // Runs to a fixed point (bounded by len(projects) iterations) so a
 // multi-hop wrapper chain (a wrapper of a wrapper) is fully resolved, not
