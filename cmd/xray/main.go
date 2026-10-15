@@ -459,7 +459,7 @@ func runTargetScan(ctx context.Context, repoPath string, targets targetFlags, ba
 	if err != nil {
 		return true, err
 	}
-	return true, writeReport(sarifBytes, targetSourceName(repoPath, plan), output)
+	return true, writeReport(sarifBytes, targetSourceName(repoPath, plan, resolution.Targets), output)
 }
 
 // realDirectory returns the symlink-free path of the repository directory
@@ -563,11 +563,23 @@ func workspaceRootFallbackUnitID(dir string) string {
 // its record carries the error.
 func scanPlan(ctx context.Context, plan *targetresolve.ScanPlan, base reposcan.Config, selection reposcan.ScannerSelection) (*planScanResult, error) {
 	result := &planScanResult{}
+	// The scanners match exclusion patterns below the root they are given,
+	// so a unit rooted inside a directory the user excluded (-e examples, a
+	// server at examples/srv) is checked against the repository root, as a
+	// full scan would see it.
+	repoWide := base
+	repoWide.Root = plan.RepoRoot
 	for _, unit := range plan.Units {
 		cfg := base
 		cfg.Root, cfg.ExcludedDirs, cfg.ReportRoot = unit.Root, unit.ExcludedDirs, plan.RepoRoot
+		unitSelection := selection
+		if repoWide.ShouldExclude(unit.Root) {
+			// A full scan never walks into it; only its dependency scan,
+			// which reads the whole tree, does.
+			unitSelection.Secrets, unitSelection.SAST = false, false
+		}
 		inputSummary := fmt.Sprintf("root=%s manifests=%d lockfiles=%d files=%d", unit.RelativeRoot, len(unit.Manifests), len(unit.Lockfiles), len(unit.Files))
-		result.add(plan, unit.ID, reposcan.ScanDetailed(ctx, unit.Root, &cfg, selection, unit.ID, inputSummary), func(af aggregation.AttributedFinding) bool {
+		result.add(plan, unit.ID, reposcan.ScanDetailed(ctx, unit.Root, &cfg, unitSelection, unit.ID, inputSummary), func(af aggregation.AttributedFinding) bool {
 			return plan.Reports(af.TargetIDs)
 		})
 	}
@@ -706,13 +718,21 @@ func repoSourceName(repoPath string) string {
 }
 
 // targetSourceName is the source a target scan is uploaded as: the
-// repository's, as for a full scan, followed by the target's name when the
-// plan scans one target, so that each server keeps its own report history.
-func targetSourceName(repoPath string, plan *targetresolve.ScanPlan) string {
-	if len(plan.SelectedTargets) == 1 {
-		return repoSourceName(repoPath) + "/" + plan.SelectedTargets[0].Name
+// repository's, as for a full scan, followed, when the plan scans one
+// target, by that target's name, so that each server keeps its own report
+// history. A name another of the repository's targets shares would mix two
+// servers' histories, so such a target is named by its directory instead.
+func targetSourceName(repoPath string, plan *targetresolve.ScanPlan, targets []*targetresolve.Target) string {
+	if len(plan.SelectedTargets) != 1 {
+		return repoSourceName(repoPath)
 	}
-	return repoSourceName(repoPath)
+	selected := plan.SelectedTargets[0]
+	for _, other := range targets {
+		if other.ID != selected.ID && other.Name == selected.Name {
+			return repoSourceName(repoPath) + "/" + selected.Project.RelDir
+		}
+	}
+	return repoSourceName(repoPath) + "/" + selected.Name
 }
 
 func printJSON(value interface{}) error {

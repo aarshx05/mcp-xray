@@ -262,9 +262,37 @@ func TestRunTargetScan_ScansThroughASymlinkedRoot(t *testing.T) {
 	}
 }
 
+// A server under a directory the user excluded is not scanned for secrets
+// or SAST findings, as a full scan never walks into it: the exclusion holds
+// although the scanners only match patterns below the unit's own root.
+func TestRunTargetScan_ExcludedAncestorStaysExcluded(t *testing.T) {
+	repo := writeTwoServerRepo(t)
+	token := "gh" + "p_" + "8sR2kQ9vLx4TzW7nB1mYc5pD3fH6jE0aK2uV" // split so this file holds no token
+	writeFile(t, repo, "servers/alpha/alpha/config.py", "GITHUB_TOKEN = \""+token+"\"\n")
+	output := filepath.Join(t.TempDir(), "report.sarif.json")
+	base := *reposcan.DefaultConfig()
+	base.Root = repo
+	base.ExcludedPaths = append(base.ExcludedPaths, "servers")
+
+	var handled bool
+	var err error
+	captureStdout(t, func() {
+		handled, err = runTargetScan(context.Background(), repo, targetFlags{enabled: true, all: true, includeRepoGlobal: true}, base, reposcan.ScannerSelection{Secrets: true}, reportOutput{path: output})
+	})
+	if !handled || err != nil {
+		t.Fatalf("runTargetScan = %v, %v; want a handled scan", handled, err)
+	}
+	if results := readSARIFRun(t, output).Results; len(results) != 0 {
+		t.Errorf("reported %d findings from the excluded servers/ directory, want none", len(results))
+	}
+}
+
 func TestTargetSourceName(t *testing.T) {
-	alpha := &targetresolve.Target{ID: "target-a", Name: "alpha"}
-	beta := &targetresolve.Target{ID: "target-b", Name: "beta"}
+	alpha := &targetresolve.Target{ID: "target-a", Name: "alpha", Project: &targetresolve.Project{RelDir: "servers/alpha"}}
+	beta := &targetresolve.Target{ID: "target-b", Name: "beta", Project: &targetresolve.Project{RelDir: "servers/beta"}}
+	server1 := &targetresolve.Target{ID: "target-c", Name: "server", Project: &targetresolve.Project{RelDir: "a"}}
+	server2 := &targetresolve.Target{ID: "target-d", Name: "server", Project: &targetresolve.Project{RelDir: "b"}}
+	all := []*targetresolve.Target{alpha, beta, server1, server2}
 	cases := []struct {
 		repoPath string
 		selected []*targetresolve.Target
@@ -273,10 +301,13 @@ func TestTargetSourceName(t *testing.T) {
 		{"/src/mono", []*targetresolve.Target{alpha}, "mono/alpha"},
 		{"/src/mono", []*targetresolve.Target{alpha, beta}, "mono"},
 		{".", []*targetresolve.Target{alpha}, "repo-scan/alpha"},
+		// Two servers named "server" keep separate histories.
+		{"/src/mono", []*targetresolve.Target{server1}, "mono/a"},
+		{"/src/mono", []*targetresolve.Target{server2}, "mono/b"},
 	}
 	for _, tc := range cases {
 		plan := &targetresolve.ScanPlan{SelectedTargets: tc.selected}
-		if got := targetSourceName(tc.repoPath, plan); got != tc.want {
+		if got := targetSourceName(tc.repoPath, plan, all); got != tc.want {
 			t.Errorf("targetSourceName(%q, %d targets) = %q, want %q", tc.repoPath, len(tc.selected), got, tc.want)
 		}
 	}

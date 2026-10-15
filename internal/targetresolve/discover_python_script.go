@@ -13,12 +13,13 @@ import (
 // requirements.txt, with no Python manifest at all.
 func discoverLegacyPythonScripts(repoRoot string) ([]*Project, error) {
 	var candidates []*Project
+	enclosed := make(map[string]bool)
 	err := walkFiles(repoRoot, nil, func(path string, info os.FileInfo) error {
 		if !strings.HasSuffix(info.Name(), ".py") {
 			return nil
 		}
 		dir := filepath.Dir(path)
-		if hasEnclosingPythonManifest(dir, repoRoot) {
+		if hasEnclosingPythonManifest(dir, repoRoot, enclosed) {
 			return nil
 		}
 		data, err := readFileCapped(path)
@@ -46,22 +47,20 @@ func discoverLegacyPythonScripts(repoRoot string) ([]*Project, error) {
 // already found, so a setup.py-based legacy package (out of scope for this
 // feature) is also correctly excluded from this manifest-less special case,
 // and a .py file nested several directories below a distant ancestor
-// manifest is excluded too, not just an immediate sibling.
-func hasEnclosingPythonManifest(dir, repoRoot string) bool {
-	repoRoot = filepath.Clean(repoRoot)
-	for cur := filepath.Clean(dir); ; {
-		if declaresPythonProject(filepath.Join(cur, "pyproject.toml")) || fileExists(filepath.Join(cur, "setup.py")) {
-			return true
-		}
-		if cur == repoRoot {
-			return false
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return false
-		}
-		cur = parent
+// manifest is excluded too, not just an immediate sibling. enclosed
+// memoizes the answer per directory: without it, every .py file reparses
+// each of its ancestors' pyproject.toml.
+func hasEnclosingPythonManifest(dir, repoRoot string, enclosed map[string]bool) bool {
+	dir = filepath.Clean(dir)
+	if answer, ok := enclosed[dir]; ok {
+		return answer
 	}
+	answer := declaresPythonProject(filepath.Join(dir, "pyproject.toml")) || fileExists(filepath.Join(dir, "setup.py"))
+	if parent := filepath.Dir(dir); !answer && dir != filepath.Clean(repoRoot) && parent != dir {
+		answer = hasEnclosingPythonManifest(parent, repoRoot, enclosed)
+	}
+	enclosed[dir] = answer
+	return answer
 }
 
 // declaresPythonProject reports whether the pyproject.toml at path declares
@@ -121,14 +120,18 @@ func classifyPythonScriptProject(p *Project) (Role, []string) {
 
 // markEmbeddedScripts sets EmbeddedScript on every manifest-less script
 // that lies inside the scan root of another project, one that
-// ownsDirectory. It runs once ownership roots are assigned.
+// ownsDirectory. A Python project around a script does not count: the
+// script was found only because no Python manifest above it declares a
+// package (hasEnclosingPythonManifest), so that one holds tool settings
+// alone, such as a repository-wide [tool.ruff], and packages none of the
+// files around the script. It runs once ownership roots are assigned.
 func markEmbeddedScripts(projects []*Project) {
 	for _, script := range projects {
 		if ownsDirectory(script) {
 			continue
 		}
 		for _, other := range projects {
-			if ownsDirectory(other) && within(script.Dir, other.ScanRoot()) {
+			if ownsDirectory(other) && other.Ecosystem != "python" && within(script.Dir, other.ScanRoot()) {
 				script.EmbeddedScript = true
 				break
 			}

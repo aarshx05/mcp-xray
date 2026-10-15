@@ -57,9 +57,13 @@ type ScanUnit struct {
 	TargetIDs    []string            `json:"targetIds,omitempty"`
 	Relations    map[string]Relation `json:"relations,omitempty"`
 	ExcludedDirs []string            `json:"excludedDirs,omitempty"`
-	Files        []string            `json:"files,omitempty"`
-	Manifests    []string            `json:"manifests,omitempty"`
-	Lockfiles    []string            `json:"lockfiles,omitempty"`
+	// Files lists the inventory files the unit's scanners read, those
+	// outside its ExcludedDirs; Manifests and Lockfiles are its dependency
+	// files. The dependency scan also reads dependency files in directories
+	// the default exclusions skip, as a full scan's does, which no list names.
+	Files     []string `json:"files,omitempty"`
+	Manifests []string `json:"manifests,omitempty"`
+	Lockfiles []string `json:"lockfiles,omitempty"`
 
 	// FallbackLockfiles maps each workspace lockfile that pins a project
 	// this unit scans for a selected target to the IDs of the targets
@@ -566,9 +570,10 @@ func appendUniqueStr(s []string, values ...string) []string {
 }
 
 // OwnershipOf returns the ownership of file, given as an absolute path or
-// relative to the repository root. A file outside the inventory (one in a
-// directory the default exclusions skip, scanned because the run turned
-// them off) is owned by the components whose roots contain it.
+// relative to the repository root. A file outside the inventory, in a
+// directory the default exclusions skip (a lockfile the dependency scan
+// reads there, or any file when the run turned the exclusions off), is
+// owned by the components whose roots contain it.
 func (p *ScanPlan) OwnershipOf(file string) FileOwnership {
 	rel := file
 	if filepath.IsAbs(file) {
@@ -667,8 +672,9 @@ func isExcludedFromUnit(unit *ScanUnit, abs string) bool {
 // include the project. A project a target includes inside this unit (and
 // not pruned from it) relies on one when no lockfile of its own ecosystem
 // family pins it (hasOwnLockfile): it then relies on the lockfiles that can
-// pin it (rootLockfileCanPin) in the nearest directory above it holding any,
-// up to the repository root. The decision is made per project and per
+// pin it (rootLockfileCanPin) as a member of their workspace
+// (workspaceMembership) in the nearest directory above it holding any, up
+// to the repository root. The decision is made per project and per
 // family: a Python package's uv.lock says nothing about the Node package
 // next to it, and a nested project's own lockfile says nothing about the
 // project enclosing it. It does not depend on where the lockfile is
@@ -698,6 +704,7 @@ func workspaceRootFallbackLockfiles(resolution *Resolution, selected []*Target, 
 		}
 	}
 
+	members := newWorkspaceMembership(resolution.RepoRoot)
 	needed := make(map[string][]string)
 	for _, target := range selected {
 		if !containsString(unit.TargetIDs, target.ID) {
@@ -712,7 +719,7 @@ func workspaceRootFallbackLockfiles(resolution *Resolution, selected []*Target, 
 			if family == "" || hasOwnLockfile(unitLockfiles, family, root, projectRoots) {
 				continue
 			}
-			for _, lockfile := range nearestWorkspaceLockfiles(lockfilesByDir, resolution.RepoRoot, root, project.Ecosystem) {
+			for _, lockfile := range nearestWorkspaceLockfiles(lockfilesByDir, resolution.RepoRoot, project, members) {
 				needed[lockfile] = appendUniqueStr(needed[lockfile], target.ID)
 			}
 		}
@@ -736,15 +743,16 @@ func hasOwnLockfile(lockfiles []string, family, root string, projectRoots []stri
 }
 
 // nearestWorkspaceLockfiles returns the lockfiles of lockfilesByDir that can
-// pin a project of the given ecosystem rooted at root (rootLockfileCanPin)
-// and lie in the nearest directory above root, up to repoRoot, holding any.
-func nearestWorkspaceLockfiles(lockfilesByDir map[string][]string, repoRoot, root, ecosystem string) []string {
+// pin project (rootLockfileCanPin) as a member of their workspace (members)
+// and lie in the nearest directory above its scan root, up to repoRoot,
+// holding any.
+func nearestWorkspaceLockfiles(lockfilesByDir map[string][]string, repoRoot string, project *Project, members *workspaceMembership) []string {
 	repoRoot = filepath.Clean(repoRoot)
-	for dir := root; dir != repoRoot && within(dir, repoRoot); {
+	for dir := project.ScanRoot(); dir != repoRoot && within(dir, repoRoot); {
 		dir = filepath.Dir(dir)
 		var found []string
 		for _, lockfile := range lockfilesByDir[dir] {
-			if rootLockfileCanPin(filepath.Base(lockfile), ecosystem) {
+			if name := filepath.Base(lockfile); rootLockfileCanPin(name, project.Ecosystem) && members.includes(dir, name, project) {
 				found = append(found, lockfile)
 			}
 		}
@@ -788,6 +796,11 @@ func applyWorkspaceRootFallbackOwnership(plan *ScanPlan, selected []*Target) {
 			if existing := plan.FileOwnership[path]; existing != nil {
 				fo.TargetIDs = appendUniqueStr(append([]string{}, existing.TargetIDs...), targetIDs...)
 				fo.ComponentIDs = appendUniqueStr(append([]string{}, existing.ComponentIDs...), componentIDs...)
+				if len(existing.TargetIDs) > 0 {
+					// A selected target's own lockfile: as in ownershipModel.of,
+					// the file keeps the strongest of its relations.
+					fo.Relation = existing.Relation
+				}
 			} else {
 				fo.TargetIDs = targetIDs
 				fo.ComponentIDs = componentIDs
@@ -796,6 +809,23 @@ func applyWorkspaceRootFallbackOwnership(plan *ScanPlan, selected []*Target) {
 			sort.Strings(fo.ComponentIDs)
 			plan.FileOwnership[path] = fo
 		}
+	}
+}
+
+// resolveSymlinks returns the absolute path with its symlinks resolved, as
+// the repository root is (a report given as -o through a symlinked checkout
+// lies in it all the same). A path not written yet is resolved through its
+// nearest existing ancestor.
+func resolveSymlinks(path string) string {
+	rest := ""
+	for dir := path; ; dir = filepath.Dir(dir) {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(real, rest)
+		}
+		if filepath.Dir(dir) == dir {
+			return path
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
 	}
 }
 
@@ -809,6 +839,7 @@ func generatedRelativeExcludes(repoRoot string, options PlanOptions) []string {
 		if err != nil {
 			continue
 		}
+		abs = resolveSymlinks(abs)
 		if within(abs, repoRoot) && abs != filepath.Clean(repoRoot) {
 			result = append(result, repoRelative(repoRoot, abs))
 		}

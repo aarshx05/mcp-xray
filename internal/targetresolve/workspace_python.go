@@ -1,13 +1,10 @@
 package targetresolve
 
 import (
-	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
-
-	toml "github.com/pelletier/go-toml/v2"
 )
 
 var pep503Separators = regexp.MustCompile(`[-_.]+`)
@@ -27,12 +24,8 @@ func normalizePEP503(name string) string {
 // approach for loosely-typed external data (see pentest's
 // extractValueFromResponse).
 func readPyprojectToml(manifestPath string) (map[string]interface{}, error) {
-	data, err := readFileCapped(manifestPath)
-	if err != nil {
-		return nil, err
-	}
 	var doc map[string]interface{}
-	if err := toml.Unmarshal(data, &doc); err != nil {
+	if err := readTOMLFile(manifestPath, &doc); err != nil {
 		return nil, err
 	}
 	return doc, nil
@@ -223,7 +216,7 @@ func (workspace *uvWorkspace) hasMember(dir string) bool {
 	}
 	matches := func(globs []string) bool {
 		for _, glob := range globs {
-			if ok, _ := path.Match(path.Clean(glob), filepath.ToSlash(rel)); ok {
+			if matchWorkspaceGlob(glob, filepath.ToSlash(rel)) {
 				return true
 			}
 		}

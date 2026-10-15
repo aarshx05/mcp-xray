@@ -193,7 +193,11 @@ func printTargetHint(repoPath string) {
 	if !isTerminal(os.Stdout) {
 		return
 	}
-	if resolution, err := targetresolve.Resolve(repoPath); err == nil && len(resolution.Targets) >= 2 {
+	root, err := realDirectory(repoPath)
+	if err != nil {
+		return
+	}
+	if resolution, err := targetresolve.Resolve(root); err == nil && len(resolution.Targets) >= 2 {
 		fmt.Printf("Detected %d MCP targets in this repository. To scan them individually instead of the whole repository, rerun with --list-targets.\n", len(resolution.Targets))
 	}
 }

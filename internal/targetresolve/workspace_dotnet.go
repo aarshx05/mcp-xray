@@ -84,8 +84,10 @@ func dotnetPackageReferencePrefix(doc *csprojFile, prefix string) bool {
 //     this reference," and it is skipped rather than guessed at, the same
 //     conservative posture isLocalFilesystemPath already uses for Go.
 //  2. Wildcards. A ProjectReference Include can be a glob
-//     (e.g. "$(RepoRoot)\tools\Fabric.*\src\*.csproj"), resolved here via
-//     filepath.Glob after normalizing MSBuild's backslashes.
+//     (e.g. "$(RepoRoot)\tools\Fabric.*\src\*.csproj"), matched here,
+//     after normalizing MSBuild's backslashes, against the projects
+//     discovered in the repository -- never against the filesystem, where a
+//     pattern like /*/*/*/*/*.csproj would walk the whole disk.
 func resolveDotnetLocalDeps(repoRoot string, projects []*Project) {
 	byDir := make(map[string]*Project)
 	for _, p := range projects {
@@ -136,12 +138,10 @@ func resolveDotnetProjectReference(p *Project, rawInclude string, repoRoot strin
 	}
 
 	if strings.Contains(expanded, "*") {
-		matches, err := filepath.Glob(expanded)
-		if err != nil {
-			return
-		}
-		for _, m := range matches {
-			addDotnetProjectDep(p, m, byDir)
+		for _, dep := range byDir {
+			if matched, _ := filepath.Match(expanded, dep.ManifestPath); matched {
+				addDotnetProjectDep(p, dep.ManifestPath, byDir)
+			}
 		}
 		return
 	}

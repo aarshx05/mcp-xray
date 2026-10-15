@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	toml "github.com/pelletier/go-toml/v2"
 )
 
 // hasOwnEntrypointEvidence reports whether p has independent proof of being
@@ -161,15 +159,16 @@ func nestedProjectRoots(projects []*Project) []string {
 // the platform runs, the way a bin entry names a command.
 func hasWorkerEntrypoint(p *Project) bool {
 	for _, name := range []string{"wrangler.toml", "wrangler.json", "wrangler.jsonc"} {
-		data, err := readFileCapped(filepath.Join(p.Dir, name))
-		if err != nil {
-			continue
-		}
+		path := filepath.Join(p.Dir, name)
 		var config map[string]interface{}
+		var err error
 		if strings.HasSuffix(name, ".toml") {
-			err = toml.Unmarshal(data, &config)
+			err = readTOMLFile(path, &config)
 		} else {
-			err = json.Unmarshal(jsoncToJSON(data), &config)
+			var data []byte
+			if data, err = readFileCapped(path); err == nil {
+				err = json.Unmarshal(jsoncToJSON(data), &config)
+			}
 		}
 		if err == nil && declaresWorkerMain(config) {
 			return true

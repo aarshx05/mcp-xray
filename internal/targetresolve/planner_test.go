@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -361,6 +362,7 @@ func TestBuildScanPlan_RootTargetExcludesNestedForeignProjects(t *testing.T) {
 // resulting finding ownership should credit both targets, not neither.
 func TestWorkspaceRootFallback_TriggersWhenUnitHasNoOwnLockfile(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	mcpDir := filepath.Join(root, "packages", "mcp")
 	otherDir := filepath.Join(root, "packages", "openapi-mcp-server")
 	for _, dir := range []string{mcpDir, otherDir} {
@@ -474,6 +476,7 @@ func TestWorkspaceRootFallback_EcosystemMismatchNeverFallsBack(t *testing.T) {
 // lockfile" -- that file will never actually reach the scanner.
 func TestWorkspaceRootFallback_ExcludedOwnLockfileStillTriggersFallback(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	appDir := filepath.Join(root, "app")
 	foreignDir := filepath.Join(root, "app", "vendor", "foreign")
 	for _, dir := range []string{appDir, foreignDir} {
@@ -521,6 +524,7 @@ func TestWorkspaceRootFallback_ExcludedOwnLockfileStillTriggersFallback(t *testi
 // must not be attributed to the target.
 func TestWorkspaceRootFallback_EvaluatesEachEcosystemIndependently(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	appDir := filepath.Join(root, "app")
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -564,6 +568,7 @@ func TestWorkspaceRootFallback_EvaluatesEachEcosystemIndependently(t *testing.T)
 // though the unit's primary Node package is fully pinned.
 func TestWorkspaceRootFallback_CountsFoldedNestedProjects(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	appDir := filepath.Join(root, "app")
 	helperDir := filepath.Join(appDir, "helper")
 	if err := os.MkdirAll(helperDir, 0o755); err != nil {
@@ -681,6 +686,7 @@ func TestWorkspaceRootFallback_IgnoresProjectsNoTargetIncludes(t *testing.T) {
 // need it, and that must not depend on which other targets are selected.
 func TestWorkspaceRootFallback_AttributesOnlyToTargetsThatNeedIt(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	aDir, bDir := filepath.Join(root, "a"), filepath.Join(root, "b")
 	libsDir := filepath.Join(root, "libs")
 	helperDir := filepath.Join(libsDir, "pyhelper")
@@ -739,6 +745,7 @@ func TestWorkspaceRootFallback_AttributesOnlyToTargetsThatNeedIt(t *testing.T) {
 // must not inherit lockfiles for an ecosystem it does not use.
 func TestBuildScanPlan_FoldedNestedTargetKeepsUnitAndFallback(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	appDir := filepath.Join(root, "app")
 	toolDir := filepath.Join(appDir, "pytool")
 	if err := os.MkdirAll(toolDir, 0o755); err != nil {
@@ -807,11 +814,13 @@ func TestBuildScanPlan_FoldedDependencyKeepsDirectRelation(t *testing.T) {
 // members beneath it.
 func TestWorkspaceRootFallback_OwnLockfileIsDecidedPerProject(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	appDir := filepath.Join(root, "app")
 	pluginDir := filepath.Join(appDir, "plugins", "b")
 	if err := os.MkdirAll(pluginDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	declareWorkspace(t, appDir, "plugins/*")
 	app := &Project{ID: "p-a", Name: "a", Dir: appDir, OwnershipRoot: appDir, ComponentID: "c-a", Ecosystem: "node"}
 	plugin := &Project{ID: "p-b", Name: "b", Dir: pluginDir, OwnershipRoot: pluginDir, ComponentID: "c-b", Ecosystem: "node"}
 	targetA := &Target{ID: "t-a", Name: "a", Project: app, Included: []*Project{app}, IncludedReasons: map[string]InclusionReason{appDir: InclusionPrimary}, ComponentID: "c-a"}
@@ -863,6 +872,7 @@ func TestWorkspaceRootFallback_OwnLockfileIsDecidedPerProject(t *testing.T) {
 // requirements file describes something else entirely.
 func TestWorkspaceRootFallback_OnlyWorkspaceLockfilesQualify(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	pyDir := filepath.Join(root, "servers", "py")
 	if err := os.MkdirAll(pyDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -1159,9 +1169,11 @@ func TestScanPlan_FallbackLockfileDirs(t *testing.T) {
 // A workspace member relies on the root lockfile whichever unit scans it:
 // its own, or the unit of a root-level target it is folded into. It is
 // credited with the lockfile's findings either way, and the lockfile is
-// scanned on its own only when no unit scans it.
+// scanned on its own only when no unit scans it. When a selected root-level
+// target owns the lockfile outright, the file keeps that stronger relation.
 func TestWorkspaceRootFallback_CreditDoesNotDependOnTheScanningUnit(t *testing.T) {
 	root := t.TempDir()
+	declareWorkspace(t, root, "**")
 	aDir, bDir := filepath.Join(root, "packages", "a"), filepath.Join(root, "packages", "b")
 	rootProject := &Project{ID: "p-root", Name: "root", Dir: root, OwnershipRoot: root, ComponentID: "c-root", Ecosystem: "node"}
 	a := &Project{ID: "p-a", Name: "a", Dir: aDir, OwnershipRoot: aDir, ComponentID: "c-a", Ecosystem: "node"}
@@ -1183,14 +1195,15 @@ func TestWorkspaceRootFallback_CreditDoesNotDependOnTheScanningUnit(t *testing.T
 	for _, tc := range []struct {
 		name      string
 		options   PlanOptions
-		credited  string // targets credited with package-lock.json
-		ownedScan string // FallbackLockfileDirs
+		credited  string   // targets credited with package-lock.json
+		relation  Relation // its relation
+		ownedScan string   // FallbackLockfileDirs
 	}{
-		{"one member", PlanOptions{TargetIDs: []string{"t-a"}}, "t-a", "."},
-		{"both members", PlanOptions{TargetIDs: []string{"t-a", "t-b"}}, "t-a,t-b", "."},
-		{"a member and the root target", PlanOptions{TargetIDs: []string{"t-a", "t-root"}}, "t-a,t-root", ""},
-		{"all targets", PlanOptions{AllTargets: true}, "t-a,t-b,t-root", ""},
-		{"a member and repository-global content", PlanOptions{TargetIDs: []string{"t-a"}, IncludeRepoGlobal: true}, "t-a", ""},
+		{"one member", PlanOptions{TargetIDs: []string{"t-a"}}, "t-a", RelationWorkspaceRoot, "."},
+		{"both members", PlanOptions{TargetIDs: []string{"t-a", "t-b"}}, "t-a,t-b", RelationWorkspaceRoot, "."},
+		{"a member and the root target", PlanOptions{TargetIDs: []string{"t-a", "t-root"}}, "t-a,t-root", RelationDirect, ""},
+		{"all targets", PlanOptions{AllTargets: true}, "t-a,t-b,t-root", RelationDirect, ""},
+		{"a member and repository-global content", PlanOptions{TargetIDs: []string{"t-a"}, IncludeRepoGlobal: true}, "t-a", RelationWorkspaceRoot, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan, err := BuildScanPlan(resolution, tc.options)
@@ -1198,8 +1211,8 @@ func TestWorkspaceRootFallback_CreditDoesNotDependOnTheScanningUnit(t *testing.T
 				t.Fatal(err)
 			}
 			fo := plan.OwnershipOf("package-lock.json")
-			if strings.Join(fo.TargetIDs, ",") != tc.credited || fo.Relation != RelationWorkspaceRoot {
-				t.Errorf("package-lock.json ownership = %+v, want credited to %s as %s", fo, tc.credited, RelationWorkspaceRoot)
+			if strings.Join(fo.TargetIDs, ",") != tc.credited || fo.Relation != tc.relation {
+				t.Errorf("package-lock.json ownership = %+v, want credited to %s as %s", fo, tc.credited, tc.relation)
 			}
 			if got := strings.Join(plan.FallbackLockfileDirs(), ","); got != tc.ownedScan {
 				t.Errorf("FallbackLockfileDirs() = %q, want %q", got, tc.ownedScan)
@@ -1299,6 +1312,7 @@ func TestBuildInventory(t *testing.T) {
 		"app/src/findings_store.js":     "",
 		"app/node_modules/dep/index.js": "",
 		"app/bin/cli.js":                "",
+		"app/src/bin/server.rs":         "",
 		"app/plugin/package.json":       `{"name": "plugin"}`,
 		"README.md":                     "",
 		"findings-repo-scan-2026-01-02T03-04-05Z.sarif.json":   "{}",
@@ -1322,7 +1336,7 @@ func TestBuildInventory(t *testing.T) {
 		paths = append(paths, entry.Path)
 	}
 	if strings.Join(paths, ",") != "README.md,app/package-lock.json,app/package.json,app/plugin/package.json,app/src/findings_store.js,app/src/index.js" {
-		t.Errorf("inventory = %v, want the six source files outside node_modules/ and bin/", paths)
+		t.Errorf("inventory = %v, want the six source files outside node_modules/, bin/ and src/bin/, which the scanners skip", paths)
 	}
 	if e := got["app/plugin/package.json"]; e.Ownership != "app/plugin" || len(e.ProjectIDs) != 2 {
 		t.Errorf("app/plugin/package.json = %+v, want both projects listed and the innermost, app/plugin, as owner", e)
@@ -1460,5 +1474,81 @@ func TestWorkspaceRootFallback_EmbeddedScriptDirectoryKeepsTheProjectsLockfile(t
 		if names := fallbackNames(unit); names != "" {
 			t.Errorf("unit %s relies on %s, want the server pinned by its own server/app/package-lock.json", unit.RelativeRoot, names)
 		}
+	}
+}
+
+// A repository-wide pyproject.toml holding only tool settings packages
+// nothing: a script server below it still owns its directory, config files
+// included.
+func TestBuildScanPlan_ToolSettingsPyprojectLeavesAScriptItsDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[tool.ruff]\nline-length = 100\n")
+	writeFile(t, filepath.Join(root, "srv", "server.py"), "from mcp.server.fastmcp import FastMCP\nmcp = FastMCP(\"srv\")\nif __name__ == \"__main__\":\n    mcp.run()\n")
+	writeFile(t, filepath.Join(root, "srv", "config.json"), `{"token": "x"}`)
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.SelectedTargets) != 1 {
+		t.Fatalf("targets = %d, want the script server", len(plan.SelectedTargets))
+	}
+	if got := plan.OwnershipOf(filepath.Join(root, "srv", "config.json")).TargetIDs; len(got) != 1 || got[0] != plan.SelectedTargets[0].ID {
+		t.Errorf("srv/config.json credited to %v, want the script server", got)
+	}
+}
+
+// A report written through a symlink to the checkout lies in the
+// repository all the same, and stays out of the scan.
+func TestGeneratedRelativeExcludes_ResolvesSymlinkedOutputPaths(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "checkout")
+	if err := os.Symlink(root, link); err != nil {
+		t.Skipf("cannot create a symlink: %v", err)
+	}
+	got := generatedRelativeExcludes(root, PlanOptions{OutputPath: filepath.Join(link, "out", "report.sarif.json"), OutputDirs: []string{filepath.Join(link, "reports")}})
+	if strings.Join(got, ",") != "out/report.sarif.json,reports" {
+		t.Errorf("generatedRelativeExcludes = %v, want both outputs, relative to the repository", got)
+	}
+}
+
+// declareWorkspace makes root the root of an npm workspace and a uv
+// workspace whose members match globs: a workspace lockfile at root pins
+// only its members.
+func declareWorkspace(t *testing.T, root string, globs ...string) {
+	t.Helper()
+	quoted := make([]string, len(globs))
+	for i, glob := range globs {
+		quoted[i] = strconv.Quote(glob)
+	}
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "workspace", "private": true, "workspaces": [`+strings.Join(quoted, ", ")+`]}`)
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[tool.uv.workspace]\nmembers = ["+strings.Join(quoted, ", ")+"]\n")
+}
+
+// A lockfile above a server that is no member of its workspace -- a root
+// package-lock.json for the repository's own tooling -- does not pin it,
+// so the server is not credited with that lockfile's findings.
+func TestWorkspaceRootFallback_NonMemberIsNotPinned(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "tooling", "private": true, "devDependencies": {"prettier": "^3"}}`)
+	srvDir := filepath.Join(root, "servers", "srv")
+	srv := &Project{ID: "p-srv", Name: "srv", Dir: srvDir, OwnershipRoot: srvDir, ComponentID: "c-srv", Ecosystem: "node"}
+	target := &Target{ID: "t-srv", Name: "srv", Project: srv, Included: []*Project{srv}, IncludedReasons: map[string]InclusionReason{srvDir: InclusionPrimary}, ComponentID: "c-srv"}
+	resolution := &Resolution{RepoRoot: root, Projects: []*Project{srv}, Targets: []*Target{target}, Inventory: []InventoryEntry{{Path: "package-lock.json", Lockfile: true}}}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirs := plan.FallbackLockfileDirs(); len(dirs) != 0 {
+		t.Errorf("FallbackLockfileDirs() = %v, want none: srv is no workspace member", dirs)
+	}
+	if fo := plan.OwnershipOf("package-lock.json"); len(fo.TargetIDs) != 0 {
+		t.Errorf("package-lock.json credited to %v, want no target", fo.TargetIDs)
 	}
 }

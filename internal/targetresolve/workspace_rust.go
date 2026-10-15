@@ -1,10 +1,6 @@
 package targetresolve
 
-import (
-	"path/filepath"
-
-	toml "github.com/pelletier/go-toml/v2"
-)
+import "path/filepath"
 
 // readCargoToml centralizes the read+parse boilerplate, mirroring
 // readPyprojectToml. Parsed into an untyped map because Cargo.toml's
@@ -14,12 +10,8 @@ import (
 // style workspace_python.go already uses for pyproject.toml, for the same
 // reason.
 func readCargoToml(manifestPath string) (map[string]interface{}, error) {
-	data, err := readFileCapped(manifestPath)
-	if err != nil {
-		return nil, err
-	}
 	var doc map[string]interface{}
-	if err := toml.Unmarshal(data, &doc); err != nil {
+	if err := readTOMLFile(manifestPath, &doc); err != nil {
 		return nil, err
 	}
 	return doc, nil

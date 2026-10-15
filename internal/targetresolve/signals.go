@@ -142,7 +142,8 @@ var ecosystemSourceExtensions = map[string][]string{
 // a library.
 //
 //   - Go: a main function in package main, and a server run or served by
-//     it: the SDK's Server.Run(ctx, transport), mcp-go's ServeStdio, or
+//     it: the SDK's Server.Run with a context (ctx, cmd.Context(),
+//     context.Background()) and a transport, mcp-go's ServeStdio, or
 //     net/http's ListenAndServe -- never t.Run or exec.Cmd.Run.
 //   - Node: nodeEntrypointPattern.
 //   - Python: run or serve called on a server, MCP or app object, or the
@@ -156,7 +157,7 @@ var ecosystemSourceExtensions = map[string][]string{
 var wrapperEntrypointPatterns = map[string][]*regexp.Regexp{
 	"go": {
 		regexp.MustCompile(`(?ms)^package\s+main\b.*^func\s+main\s*\(\s*\)`),
-		regexp.MustCompile(`\.Run\s*\(\s*(?:ctx|context\.\w+\(\s*\))\s*,|\bServeStdio\s*\(|\bListenAndServe(?:TLS)?\s*\(`),
+		regexp.MustCompile(`\.Run\s*\(\s*(?:\w*[cC]tx\w*|context\.\w+\(\s*\)|[\w.]*Context\(\s*\))\s*,|\bServeStdio\s*\(|\bListenAndServe(?:TLS)?\s*\(`),
 	},
 	"node":   {nodeEntrypointPattern},
 	"python": {regexp.MustCompile(`(?i)\b\w*(?:mcp|server|app)\.(?:run|serve)\s*\(|\b(?:asyncio|anyio|trio|uvicorn)\.run\s*\(`)},
@@ -476,7 +477,7 @@ func projectSourceSignals(project *Project, allProjects []*Project, extensions [
 	isNestedProject := func(dir string) bool { return nestedProjectDirs[filepath.Clean(dir)] }
 
 	found := make(map[string]bool, len(patterns))
-	_ = walkFiles(project.Dir, isNestedProject, func(path string, info os.FileInfo) error {
+	_ = walkSourceFiles(project.Dir, isNestedProject, func(path string, info os.FileInfo) error {
 		if !hasAnyExt(info.Name(), extensions) || isTestSource(projDir, path) {
 			return nil
 		}

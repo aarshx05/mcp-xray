@@ -214,7 +214,7 @@ func ContextForPath(repoRelativePath string) string {
 			}
 		}
 	}
-	if isTestFileName(base) {
+	if isTestFileName(path.Base(normalized)) {
 		return "test"
 	}
 	return "production"
@@ -231,11 +231,16 @@ func isDotnetTestProject(segment string) bool {
 	return false
 }
 
-// isTestFileName reports whether a (lower-cased) file name follows a
-// language's test-file convention: Go's foo_test.go, JavaScript's
-// foo.test.ts and foo.spec.js, and pytest's test_foo.py, foo_test.py and
-// conftest.py.
-func isTestFileName(base string) bool {
+// isTestFileName reports whether a file name follows a language's test-file
+// convention: Go's foo_test.go, JavaScript's foo.test.ts and foo.spec.js,
+// pytest's test_foo.py, foo_test.py and conftest.py, and the JUnit classes
+// FooTest.java, FooTests.java and FooTestCase.java -- matched by case, as
+// a Java class is named, so that Latest.java is not one.
+func isTestFileName(name string) bool {
+	if stem, ok := strings.CutSuffix(name, ".java"); ok {
+		return strings.HasSuffix(stem, "Test") || strings.HasSuffix(stem, "Tests") || strings.HasSuffix(stem, "TestCase")
+	}
+	base := strings.ToLower(name)
 	switch ext := path.Ext(base); ext {
 	case ".go":
 		return strings.HasSuffix(base, "_test.go")

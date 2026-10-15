@@ -3,6 +3,7 @@ package targetresolve
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -170,5 +171,41 @@ func TestJSONManifestsWithByteOrderMark(t *testing.T) {
 	}
 	if !hasConsumerConfig(&Project{Dir: dir}) {
 		t.Error("hasConsumerConfig missed an mcp.json with a byte order mark")
+	}
+}
+
+// A TOML manifest is parsed by a recursive parser that takes time quadratic
+// in its size: one nested too deep kills the process with a stack overflow,
+// one too large stalls resolution. Brackets in strings and comments are not
+// nesting.
+func TestReadTOMLFile_RefusesHostileManifests(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name, content string
+		ok            bool
+	}{
+		{"an ordinary manifest", "[project]\nname = \"srv\"\ndependencies = [\"mcp>=1\", 'x[cli]']\n[tool.uv.sources]\nmcp = { workspace = true }\n", true},
+		{"brackets inside strings and comments", "a = \"" + strings.Repeat("[", 500) + "\"\nb = '''" + strings.Repeat("{", 500) + "'''\n# " + strings.Repeat("[", 500) + "\n", true},
+		{"nested beyond the limit", "a = " + strings.Repeat("[", maxTOMLNesting+1) + strings.Repeat("]", maxTOMLNesting+1) + "\n", false},
+		{"larger than the limit", "a = \"" + strings.Repeat("x", maxTOMLFileSize) + "\"\n", false},
+	}
+	for _, tc := range cases {
+		path := filepath.Join(dir, "pyproject.toml")
+		writeFile(t, path, tc.content)
+		var doc map[string]interface{}
+		if err := readTOMLFile(path, &doc); (err == nil) != tc.ok {
+			t.Errorf("%s: readTOMLFile error = %v, want ok=%v", tc.name, err, tc.ok)
+		}
+	}
+}
+
+// Two million nested arrays overflow the parser's stack, which no recover
+// catches: resolution must refuse the manifest rather than crash.
+func TestResolve_DeeplyNestedManifestDoesNotCrash(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"x\"\ndependencies = "+strings.Repeat("[", 2_000_000)+strings.Repeat("]", 2_000_000)+"\n")
+	writeFile(t, filepath.Join(root, "srv", "Cargo.toml"), "[package]\nname = \"srv\"\n[dependencies]\nrmcp = "+strings.Repeat("[", 2_000_000)+"\n")
+	if _, err := Resolve(root); err != nil {
+		t.Fatalf("Resolve: %v", err)
 	}
 }

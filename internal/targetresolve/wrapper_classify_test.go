@@ -278,6 +278,7 @@ func TestHasOwnEntrypointEvidence(t *testing.T) {
 		want                          bool
 	}{
 		{"go main running the server", "go", "main.go", "package main\n\nfunc main() {\n\tif err := core.New().Run(context.Background(), &mcp.StdioTransport{}); err != nil {\n\t\tpanic(err)\n\t}\n}\n", true},
+		{"go cobra command running the server", "go", "main.go", "package main\n\nfunc main() {\n\troot := &cobra.Command{RunE: func(cmd *cobra.Command, args []string) error {\n\t\treturn core.New().Run(cmd.Context(), &mcp.StdioTransport{})\n\t}}\n\troot.Execute()\n}\n", true},
 		{"go main serving HTTP", "go", "main.go", "package main\n\nfunc main() {\n\thttp.ListenAndServe(\":8080\", core.Handler())\n}\n", true},
 		{"go main running a command", "go", "main.go", "package main\n\nfunc main() {\n\texec.Command(\"go\", \"generate\").Run()\n}\n", false},
 		{"go library running a server", "go", "serve.go", "package core\n\nfunc Serve(ctx context.Context, s *mcp.Server) error {\n\treturn s.Run(ctx, &mcp.StdioTransport{})\n}\n", false},
