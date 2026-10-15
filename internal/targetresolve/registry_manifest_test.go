@@ -482,3 +482,21 @@ func TestApplyRegistryManifestSignals_SharedDirectoryDescribesItsServer(t *testi
 		t.Errorf("server confirmed = %v, tools role = %v; want the Node server confirmed and the Python tools untouched", server.RoleConfirmedByManifest, tools.Role)
 	}
 }
+
+// A manifest whose directory holds several projects and no server cannot
+// say which of them it describes: it confirms none, and stands for no
+// server of its own either.
+func TestApplyRegistryManifestSignals_SharedDirectoryWithoutAServerDescribesNone(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "server.json"), `{"name": "io.example/my-mcp", "packages": [{"registryType": "oci", "identifier": "ghcr.io/example/my-mcp"}]}`)
+	web := &Project{Name: "web", Dir: root, RelDir: ".", Ecosystem: "node", Role: RoleUnrelated}
+	tools := &Project{Name: "tools", Dir: root, RelDir: ".", Ecosystem: "python", Role: RoleUnrelated}
+
+	projects, err := applyRegistryManifestSignals(root, []*Project{web, tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 2 || web.Role != RoleUnrelated || tools.Role != RoleUnrelated {
+		t.Errorf("projects = %d, roles = %v, %v; want the two projects untouched and none synthesized", len(projects), web.Role, tools.Role)
+	}
+}

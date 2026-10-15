@@ -1,6 +1,7 @@
 package targetresolve
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -171,5 +172,23 @@ func TestAssignIdentities_NestedServerJSONOwnsItsOwnDirectory(t *testing.T) {
 
 	if server.OwnershipRoot != filepath.Clean(inner) || tool.OwnershipRoot != filepath.Clean(inner) {
 		t.Errorf("ownership roots = %q, %q; want both %q", server.OwnershipRoot, tool.OwnershipRoot, inner)
+	}
+}
+
+// A repository with nothing to list still lists every collection, empty, so
+// a consumer can iterate them without a null check.
+func TestResolutionJSON_EmptyListsAreArrays(t *testing.T) {
+	data, err := ResolutionJSON(&Resolution{RepoRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view map[string]json.RawMessage
+	if err := json.Unmarshal(data, &view); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"projects", "components", "targets", "inventory"} {
+		if got := string(view[key]); got != "[]" {
+			t.Errorf("%s = %s, want []", key, got)
+		}
 	}
 }

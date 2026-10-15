@@ -139,6 +139,65 @@ func TestBuildScanPlan_DoesNotExcludeLegitimateNestedSharedComponent(t *testing.
 	}
 }
 
+// A unit's file lists, which --explain-scope and the scan's input summary
+// report, hold only the files its scan reads: the repository-global unit
+// does not list the scheduled roots it skips, nor a target's unit the
+// unselected project nested in it.
+func TestBuildScanPlan_UnitFilesLeaveOutExcludedDirs(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "app")
+	foreignDir := filepath.Join(appDir, "tools", "other")
+	appProject := &Project{ID: "p-app", Name: "app", Dir: appDir, OwnershipRoot: appDir, ComponentID: "c-app", Ecosystem: "node"}
+	foreignProject := &Project{ID: "p-foreign", Name: "other", Dir: foreignDir, OwnershipRoot: foreignDir, ComponentID: "c-foreign", Ecosystem: "node", Role: RoleUnrelated}
+	target := &Target{ID: "t-app", Name: "app", Project: appProject, Included: []*Project{appProject}, IncludedReasons: map[string]InclusionReason{appDir: InclusionPrimary}}
+	resolution := &Resolution{
+		RepoRoot: root,
+		Projects: []*Project{appProject, foreignProject},
+		Targets:  []*Target{target},
+		Inventory: []InventoryEntry{
+			{Path: ".github/workflows/ci.yml"},
+			{Path: "app/index.js"},
+			{Path: "app/package-lock.json", Lockfile: true},
+			{Path: "app/package.json", Manifest: true},
+			{Path: "app/tools/other/package-lock.json", Lockfile: true},
+			{Path: "app/tools/other/package.json", Manifest: true},
+			{Path: "package.json", Manifest: true},
+		},
+	}
+	for _, tc := range []struct {
+		name    string
+		options PlanOptions
+		want    map[string]string // unit root -> its files, manifests and lockfiles
+	}{
+		{"target only", PlanOptions{TargetIDs: []string{"t-app"}}, map[string]string{
+			"app": "app/index.js,app/package-lock.json,app/package.json | app/package.json | app/package-lock.json",
+		}},
+		{"with repository-global content", PlanOptions{TargetIDs: []string{"t-app"}, IncludeRepoGlobal: true}, map[string]string{
+			"app": "app/index.js,app/package-lock.json,app/package.json,app/tools/other/package-lock.json,app/tools/other/package.json | app/package.json,app/tools/other/package.json | app/package-lock.json,app/tools/other/package-lock.json",
+			".":   ".github/workflows/ci.yml,package.json | package.json | ",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := BuildScanPlan(resolution, tc.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := make(map[string]string)
+			for _, unit := range plan.Units {
+				got[unit.RelativeRoot] = strings.Join(unit.Files, ",") + " | " + strings.Join(unit.Manifests, ",") + " | " + strings.Join(unit.Lockfiles, ",")
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("units = %v, want %v", got, tc.want)
+			}
+			for root, want := range tc.want {
+				if got[root] != want {
+					t.Errorf("unit %s files | manifests | lockfiles = %q, want %q", root, got[root], want)
+				}
+			}
+		})
+	}
+}
+
 // With repository-global content included, an unselected project nested in
 // a target's unit is still scanned exactly once: the global unit excludes
 // the whole scheduled root, so the target's unit keeps the nested project,
@@ -773,6 +832,9 @@ func TestWorkspaceRootFallback_OwnLockfileIsDecidedPerProject(t *testing.T) {
 		{"enclosing workspace lockfile pins the nested member",
 			[]InventoryEntry{{Path: "app/package-lock.json", Lockfile: true}, {Path: "package-lock.json", Lockfile: true}},
 			PlanOptions{AllTargets: true}, ""},
+		{"so does it with only the nested member selected",
+			[]InventoryEntry{{Path: "app/package-lock.json", Lockfile: true}, {Path: "package-lock.json", Lockfile: true}},
+			PlanOptions{TargetIDs: []string{"t-b"}}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resolution := &Resolution{RepoRoot: root, Projects: []*Project{app, plugin}, Targets: []*Target{targetA, targetB}, Inventory: tc.inventory}
@@ -786,6 +848,11 @@ func TestWorkspaceRootFallback_OwnLockfileIsDecidedPerProject(t *testing.T) {
 			}
 			if strings.Join(got, ",") != tc.want {
 				t.Errorf("package-lock.json credited to %v, want %q", got, tc.want)
+			}
+			if tc.inventory[0].Path == "app/package-lock.json" {
+				if fo := plan.FileOwnership["app/package-lock.json"]; fo == nil || !containsString(fo.TargetIDs, "t-b") {
+					t.Errorf("app/package-lock.json ownership = %+v, want t-b, the member it pins, credited", fo)
+				}
 			}
 		})
 	}
@@ -1059,26 +1126,135 @@ func fallbackNames(unit *ScanUnit) string {
 	return strings.Join(names, ",")
 }
 
-// Units that rely on root lockfiles need them scanned on their behalf,
-// unless a unit rooted at the repository root scans them anyway.
-func TestScanPlan_NeedsRootLockfileCheck(t *testing.T) {
+// Fallback lockfiles need their directory's own files scanned on the
+// reliant targets' behalf, unless a unit scans them anyway.
+func TestScanPlan_FallbackLockfileDirs(t *testing.T) {
 	repoRoot := t.TempDir()
 	member := &ScanUnit{Root: filepath.Join(repoRoot, "packages", "a"), FallbackLockfiles: map[string][]string{"package-lock.json": {"t"}}}
+	nestedMember := &ScanUnit{Root: filepath.Join(repoRoot, "ts", "packages", "b"), FallbackLockfiles: map[string][]string{"ts/pnpm-lock.yaml": {"t"}}}
 	pinned := &ScanUnit{Root: filepath.Join(repoRoot, "packages", "b")}
-	global := &ScanUnit{Root: repoRoot}
+	workspace := &ScanUnit{Root: filepath.Join(repoRoot, "ts"), FallbackLockfiles: map[string][]string{"ts/pnpm-lock.yaml": {"t"}}}
+	global := &ScanUnit{Root: repoRoot, ExcludedDirs: []string{"packages/a"}}
+	globalSkippingTS := &ScanUnit{Root: repoRoot, ExcludedDirs: []string{"packages/a", "ts"}}
 	cases := []struct {
 		name  string
 		units []*ScanUnit
-		want  bool
+		want  string
 	}{
-		{"a unit relies on a root lockfile", []*ScanUnit{pinned, member}, true},
-		{"no unit relies on one", []*ScanUnit{pinned}, false},
-		{"the repository-global unit scans the root", []*ScanUnit{member, global}, false},
+		{"a unit relies on a root lockfile", []*ScanUnit{pinned, member}, "."},
+		{"no unit relies on one", []*ScanUnit{pinned}, ""},
+		{"the repository-global unit scans the root", []*ScanUnit{member, global}, ""},
+		{"a unit relies on a nested workspace's lockfile", []*ScanUnit{member, nestedMember}, ".,ts"},
+		{"the unit scanning it is the workspace's own", []*ScanUnit{workspace}, ""},
+		{"the unit that would scan it excludes it", []*ScanUnit{nestedMember, globalSkippingTS}, "ts"},
 	}
 	for _, tc := range cases {
 		plan := &ScanPlan{RepoRoot: repoRoot, Units: tc.units}
-		if got := plan.NeedsRootLockfileCheck(); got != tc.want {
-			t.Errorf("%s: NeedsRootLockfileCheck() = %v, want %v", tc.name, got, tc.want)
+		if got := strings.Join(plan.FallbackLockfileDirs(), ","); got != tc.want {
+			t.Errorf("%s: FallbackLockfileDirs() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A workspace member relies on the root lockfile whichever unit scans it:
+// its own, or the unit of a root-level target it is folded into. It is
+// credited with the lockfile's findings either way, and the lockfile is
+// scanned on its own only when no unit scans it.
+func TestWorkspaceRootFallback_CreditDoesNotDependOnTheScanningUnit(t *testing.T) {
+	root := t.TempDir()
+	aDir, bDir := filepath.Join(root, "packages", "a"), filepath.Join(root, "packages", "b")
+	rootProject := &Project{ID: "p-root", Name: "root", Dir: root, OwnershipRoot: root, ComponentID: "c-root", Ecosystem: "node"}
+	a := &Project{ID: "p-a", Name: "a", Dir: aDir, OwnershipRoot: aDir, ComponentID: "c-a", Ecosystem: "node"}
+	b := &Project{ID: "p-b", Name: "b", Dir: bDir, OwnershipRoot: bDir, ComponentID: "c-b", Ecosystem: "node"}
+	targetRoot := &Target{ID: "t-root", Name: "root", Project: rootProject, Included: []*Project{rootProject}, IncludedReasons: map[string]InclusionReason{root: InclusionPrimary}, ComponentID: "c-root"}
+	targetA := &Target{ID: "t-a", Name: "a", Project: a, Included: []*Project{a}, IncludedReasons: map[string]InclusionReason{aDir: InclusionPrimary}, ComponentID: "c-a"}
+	targetB := &Target{ID: "t-b", Name: "b", Project: b, Included: []*Project{b}, IncludedReasons: map[string]InclusionReason{bDir: InclusionPrimary}, ComponentID: "c-b"}
+	resolution := &Resolution{
+		RepoRoot:   root,
+		Projects:   []*Project{rootProject, a, b},
+		Targets:    []*Target{targetRoot, targetA, targetB},
+		Components: []*Component{{ID: "c-root", Root: root}, {ID: "c-a", Root: aDir}, {ID: "c-b", Root: bDir}},
+		Inventory: []InventoryEntry{
+			{Path: "package-lock.json", Lockfile: true, ComponentIDs: []string{"c-root"}},
+			{Path: "packages/a/package.json", Manifest: true, ComponentIDs: []string{"c-a", "c-root"}},
+			{Path: "packages/b/package.json", Manifest: true, ComponentIDs: []string{"c-b", "c-root"}},
+		},
+	}
+	for _, tc := range []struct {
+		name      string
+		options   PlanOptions
+		credited  string // targets credited with package-lock.json
+		ownedScan string // FallbackLockfileDirs
+	}{
+		{"one member", PlanOptions{TargetIDs: []string{"t-a"}}, "t-a", "."},
+		{"both members", PlanOptions{TargetIDs: []string{"t-a", "t-b"}}, "t-a,t-b", "."},
+		{"a member and the root target", PlanOptions{TargetIDs: []string{"t-a", "t-root"}}, "t-a,t-root", ""},
+		{"all targets", PlanOptions{AllTargets: true}, "t-a,t-b,t-root", ""},
+		{"a member and repository-global content", PlanOptions{TargetIDs: []string{"t-a"}, IncludeRepoGlobal: true}, "t-a", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, err := BuildScanPlan(resolution, tc.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fo := plan.OwnershipOf("package-lock.json")
+			if strings.Join(fo.TargetIDs, ",") != tc.credited || fo.Relation != RelationWorkspaceRoot {
+				t.Errorf("package-lock.json ownership = %+v, want credited to %s as %s", fo, tc.credited, RelationWorkspaceRoot)
+			}
+			if got := strings.Join(plan.FallbackLockfileDirs(), ","); got != tc.ownedScan {
+				t.Errorf("FallbackLockfileDirs() = %q, want %q", got, tc.ownedScan)
+			}
+		})
+	}
+}
+
+// A workspace below the repository root pins its members from its own root:
+// a member relies on the nearest workspace lockfile above it, not on one
+// further up, and that lockfile is scanned on its behalf (end to end
+// through Resolve).
+func TestWorkspaceRootFallback_UsesTheNearestWorkspaceLockfile(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "tools", "private": true}`)
+	writeFile(t, filepath.Join(root, "package-lock.json"), `{}`)
+	writeFile(t, filepath.Join(root, "ts", "package.json"), `{"name": "ts-root", "private": true}`)
+	writeFile(t, filepath.Join(root, "ts", "pnpm-workspace.yaml"), "packages:\n  - \"packages/*\"\n")
+	writeFile(t, filepath.Join(root, "ts", "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	writeFile(t, filepath.Join(root, "ts", "packages", "server", "package.json"), `{"name": "ws-server", "bin": {"ws-server": "index.js"}, "dependencies": {"@modelcontextprotocol/sdk": "1.0.0"}}`)
+	writeFile(t, filepath.Join(root, "ts", "packages", "server", "index.js"), `const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js"); new McpServer();`)
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolution.Targets) != 1 {
+		t.Fatalf("targets = %d, want 1", len(resolution.Targets))
+	}
+	for _, options := range []PlanOptions{{AllTargets: true}, {AllTargets: true, IncludeRepoGlobal: true}} {
+		plan, err := BuildScanPlan(resolution, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fallbacks []string
+		for _, unit := range plan.Units {
+			if names := fallbackNames(unit); names != "" {
+				fallbacks = append(fallbacks, names)
+			}
+		}
+		if strings.Join(fallbacks, ";") != "ts/pnpm-lock.yaml" {
+			t.Errorf("%+v: FallbackLockfiles = %v, want [ts/pnpm-lock.yaml]", options, fallbacks)
+		}
+		if fo := plan.OwnershipOf("ts/pnpm-lock.yaml"); strings.Join(fo.TargetIDs, ",") != resolution.Targets[0].ID {
+			t.Errorf("%+v: ts/pnpm-lock.yaml ownership = %+v, want credited to the server", options, fo)
+		}
+		if fo := plan.OwnershipOf("package-lock.json"); len(fo.TargetIDs) != 0 {
+			t.Errorf("%+v: package-lock.json ownership = %+v, want no target", options, fo)
+		}
+		want := "ts"
+		if options.IncludeRepoGlobal {
+			want = "" // the repository-global unit scans ts/ itself
+		}
+		if got := strings.Join(plan.FallbackLockfileDirs(), ","); got != want {
+			t.Errorf("%+v: FallbackLockfileDirs() = %q, want %q", options, got, want)
 		}
 	}
 }
@@ -1117,15 +1293,16 @@ func TestBuildInventory(t *testing.T) {
 	root := t.TempDir()
 	appDir := filepath.Join(root, "app")
 	for path, content := range map[string]string{
-		"app/package.json":                `{"name": "app"}`,
-		"app/package-lock.json":           `{}`,
-		"app/src/index.js":                "",
-		"app/node_modules/dep/index.js":   "",
-		"app/bin/cli.js":                  "",
-		"app/plugin/package.json":         `{"name": "plugin"}`,
-		"README.md":                       "",
-		"findings-repo-scan-1.sarif.json": "{}",
-		"reports/mcpxray-run.sarif.json":  "{}",
+		"app/package.json":              `{"name": "app"}`,
+		"app/package-lock.json":         `{}`,
+		"app/src/index.js":              "",
+		"app/src/findings_store.js":     "",
+		"app/node_modules/dep/index.js": "",
+		"app/bin/cli.js":                "",
+		"app/plugin/package.json":       `{"name": "plugin"}`,
+		"README.md":                     "",
+		"findings-repo-scan-2026-01-02T03-04-05Z.sarif.json":   "{}",
+		"reports/tools_summary_2026-01-02T03-04-05+01-00.json": "{}",
 	} {
 		writeFile(t, filepath.Join(root, filepath.FromSlash(path)), content)
 	}
@@ -1144,8 +1321,8 @@ func TestBuildInventory(t *testing.T) {
 	for _, entry := range inventory {
 		paths = append(paths, entry.Path)
 	}
-	if strings.Join(paths, ",") != "README.md,app/package-lock.json,app/package.json,app/plugin/package.json,app/src/index.js" {
-		t.Errorf("inventory = %v, want the five files outside node_modules/ and bin/", paths)
+	if strings.Join(paths, ",") != "README.md,app/package-lock.json,app/package.json,app/plugin/package.json,app/src/findings_store.js,app/src/index.js" {
+		t.Errorf("inventory = %v, want the six source files outside node_modules/ and bin/", paths)
 	}
 	if e := got["app/plugin/package.json"]; e.Ownership != "app/plugin" || len(e.ProjectIDs) != 2 {
 		t.Errorf("app/plugin/package.json = %+v, want both projects listed and the innermost, app/plugin, as owner", e)
@@ -1159,8 +1336,41 @@ func TestBuildInventory(t *testing.T) {
 	if e := got["README.md"]; e.Ownership != "unowned" || len(e.ProjectIDs) != 0 {
 		t.Errorf("README.md = %+v, want unowned", e)
 	}
-	if strings.Join(excluded, ",") != "findings-repo-scan-1.sarif.json,reports/mcpxray-run.sarif.json" {
+	if strings.Join(excluded, ",") != "findings-repo-scan-2026-01-02T03-04-05Z.sarif.json,reports/tools_summary_2026-01-02T03-04-05+01-00.json" {
 		t.Errorf("excluded = %v, want the two generated reports", excluded)
+	}
+}
+
+// Only the names MCP X-Ray gives its own reports are set aside; a source
+// file is never mistaken for one, whatever its name starts with.
+func TestIsGeneratedOutputPath(t *testing.T) {
+	for _, name := range []string{
+		"findings-repo-scan-2026-01-02T03-04-05Z.sarif.json",
+		"findings-config-scan-2026-01-02T03-04-05+05-30.sarif.json",
+		"out/findings-verify-2026-01-02T03-04-05-07-00.sarif.json",
+		"preliminary-findings-my-server-2026-01-02T03-04-05Z.sarif.json",
+		"tools_summary_2026-01-02T03-04-05Z.json",
+		"tools_summary_2026-01-02T03:04:05+01:00.json",
+		"pentest_plans_2026-01-02T03-04-05Z/pentest_plan_srv_read_file_2026-01-02T03:04:05Z.yaml",
+		"pentest_plans_2026-01-02T03-04-05Z/merged_test_plan.yaml",
+	} {
+		if !isGeneratedOutputPath(name) {
+			t.Errorf("isGeneratedOutputPath(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{
+		"src/findings_store.js",
+		"src/findings_utils.py",
+		"src/merged_tools.py",
+		"src/findings-report.ts",
+		"findings-repo-scan.sarif.json",
+		"tools_summary_test.go",
+		"reports/mcpxray-run.sarif.json",
+		"FINDINGS-REPO-SCAN-2026-01-02T03-04-05Z.SARIF.JSON",
+	} {
+		if isGeneratedOutputPath(name) {
+			t.Errorf("isGeneratedOutputPath(%q) = true, want false", name)
+		}
 	}
 }
 
@@ -1196,5 +1406,59 @@ func TestScanPlan_Reports(t *testing.T) {
 	plan.IncludesRepoGlobal = true
 	if !plan.Reports(nil) {
 		t.Error("a plan with repository-global content reports unowned findings too")
+	}
+}
+
+// A Python smoke-test client inside a Node server's src/ claims only its own
+// file: the server's scan unit keeps src/, and src/index.ts stays the
+// server's.
+func TestBuildScanPlan_EmbeddedScriptClaimsOnlyItsPythonFiles(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "my-mcp", "bin": {"my-mcp": "dist/index.js"}, "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+	writeFile(t, filepath.Join(root, "src", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	writeFile(t, filepath.Join(root, "src", "smoke_client.py"), "from mcp.client.stdio import stdio_client\n")
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Units) != 1 || len(plan.Units[0].ExcludedDirs) != 0 {
+		t.Fatalf("units = %+v, want one unit excluding nothing", plan.Units)
+	}
+	server := plan.SelectedTargets[0].ID
+	if got := plan.OwnershipOf(filepath.Join(root, "src", "index.ts")).TargetIDs; len(got) != 1 || got[0] != server {
+		t.Errorf("src/index.ts credited to %v, want the server %s", got, server)
+	}
+	if got := plan.OwnershipOf(filepath.Join(root, "src", "smoke_client.py")).TargetIDs; len(got) != 0 {
+		t.Errorf("the client script was credited to %v, want no target", got)
+	}
+}
+
+// An embedded script's directory is still the enclosing project's: a
+// lockfile there pins that project, which then relies on no workspace
+// lockfile above it, as if the script were not there.
+func TestWorkspaceRootFallback_EmbeddedScriptDirectoryKeepsTheProjectsLockfile(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "workspace", "private": true}`)
+	writeFile(t, filepath.Join(root, "package-lock.json"), `{}`)
+	writeFile(t, filepath.Join(root, "server", "package.json"), `{"name": "my-mcp", "bin": {"my-mcp": "dist/index.js"}, "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+	writeFile(t, filepath.Join(root, "server", "app", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	writeFile(t, filepath.Join(root, "server", "app", "package-lock.json"), `{}`)
+	writeFile(t, filepath.Join(root, "server", "app", "smoke_client.py"), "from mcp.client.stdio import stdio_client\n")
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range plan.Units {
+		if names := fallbackNames(unit); names != "" {
+			t.Errorf("unit %s relies on %s, want the server pinned by its own server/app/package-lock.json", unit.RelativeRoot, names)
+		}
 	}
 }

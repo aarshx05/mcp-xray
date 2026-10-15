@@ -99,11 +99,11 @@ func matchesAnyManifestPattern(name string) bool {
 	return matchesManifest(name) || matchesLockfile(name)
 }
 
-// rootLockfileCanPin reports whether the repository-root lockfile named
-// lockfile can stand in for the missing lockfile of a nested project of the
-// given Project.Ecosystem. Only a workspace lockfile of the project's own
-// family qualifies -- with one exception: a manifest-less Python script has
-// no package manager of its own, so the repository's plain requirements.txt
+// rootLockfileCanPin reports whether the lockfile named lockfile, in a
+// directory above a project of the given Project.Ecosystem that has none of
+// its own, can stand in for it. Only a workspace lockfile of the project's
+// own family qualifies -- with one exception: a manifest-less Python script
+// has no package manager of its own, so a plain requirements.txt above it
 // (not a dev/docs variant) is how its dependencies are installed.
 func rootLockfileCanPin(lockfile, ecosystem string) bool {
 	if ecosystem == "python-script" && lockfile == "requirements.txt" {

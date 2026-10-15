@@ -23,6 +23,10 @@ type Config struct {
 	// ~/build) can never exclude the whole scan. Empty keeps the legacy whole-path
 	// behavior.
 	Root string
+	// ReportRoot is the directory a taint finding names its file relative to, in
+	// its File and Message. Empty means the scan root; a target scan sets the
+	// repository root, so that a flow reads the same whichever unit finds it.
+	ReportRoot string
 	// CodeQLAllowBuild grants consent to compile Go targets during CodeQL analysis.
 	CodeQLAllowBuild bool
 	// CodeQLTimeoutSec overrides the per-language CodeQL budget (create + analyze), in

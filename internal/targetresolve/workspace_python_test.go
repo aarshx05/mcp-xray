@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func TestNewPythonProject_PEP621Name(t *testing.T) {
@@ -213,7 +215,8 @@ tools = { workspace = true }
 // "mcp", which the root's `mcp = { workspace = true }` makes the SDK in the
 // repository, and an inherited path is relative to the root. A member's own
 // source for a name wins, a name it does not declare is not inherited, and
-// a project the members globs leave out inherits nothing.
+// a project the members globs leave out, or the exclude globs take out,
+// inherits nothing.
 func TestResolvePythonLocalDeps_InheritsUvWorkspaceRootSources(t *testing.T) {
 	root := t.TempDir()
 	manifests := map[string]string{
@@ -223,6 +226,7 @@ dependencies = ["mcp-types"]
 
 [tool.uv.workspace]
 members = ["src/mcp-types", "examples/servers/*"]
+exclude = ["examples/servers/legacy"]
 
 [tool.uv.sources]
 mcp = { workspace = true }
@@ -235,6 +239,7 @@ helpers = { path = "libs/helpers" }
 		"examples/servers/weather": "[project]\nname = \"weather\"\ndependencies = [\"mcp\"]\n\n[dependency-groups]\ndev = [\"helpers\"]\n",
 		"examples/servers/pinned":  "[project]\nname = \"pinned\"\ndependencies = [\"mcp\"]\n\n[tool.uv.sources]\nmcp = { path = \"../../../vendor/mcp\" }\n",
 		"tools/outside":            "[project]\nname = \"outside\"\ndependencies = [\"mcp\"]\n",
+		"examples/servers/legacy":  "[project]\nname = \"legacy\"\ndependencies = [\"mcp\"]\n",
 	}
 	projects := map[string]*Project{}
 	var all []*Project
@@ -253,6 +258,7 @@ helpers = { path = "libs/helpers" }
 		"examples/servers/weather": {root, filepath.Join(root, "libs", "helpers")},
 		"examples/servers/pinned":  {filepath.Join(root, "vendor", "mcp")},
 		"tools/outside":            nil,
+		"examples/servers/legacy":  nil,
 	} {
 		if got := projects[dir].LocalDeps; !slices.Equal(got, want) {
 			t.Errorf("%s LocalDeps = %v, want %v", dir, got, want)
@@ -260,5 +266,27 @@ helpers = { path = "libs/helpers" }
 	}
 	if weather := projects["examples/servers/weather"]; !slices.Equal(weather.DevLocalDeps, []string{filepath.Join(root, "libs", "helpers")}) {
 		t.Errorf("weather DevLocalDeps = %v, want only helpers, a dependency group's", weather.DevLocalDeps)
+	}
+}
+
+// A project with dynamic dependencies lists them in a Hatch metadata hook;
+// python-sdk's SDK depends on its mcp-types sibling only there.
+func TestPythonRuntimeDependencies_HatchMetadataHook(t *testing.T) {
+	cases := []struct {
+		name, toml string
+		want       bool
+	}{
+		{"dynamic dependencies from a hook", "[project]\nname = \"mcp\"\ndynamic = [\"version\", \"dependencies\"]\n\n[tool.hatch.metadata.hooks.uv-dynamic-versioning]\ndependencies = [\"anyio>=4.9\", \"mcp-types=={{ version }}\"]\n", true},
+		{"static dependencies ignore the hook", "[project]\nname = \"mcp\"\ndependencies = [\"anyio\"]\n\n[tool.hatch.metadata.hooks.custom]\ndependencies = [\"mcp-types\"]\n", false},
+		{"malformed dynamic field", "[project]\nname = \"mcp\"\ndynamic = \"dependencies\"\n\n[tool.hatch.metadata.hooks.custom]\ndependencies = [\"mcp-types\"]\n", false},
+	}
+	for _, tc := range cases {
+		var doc map[string]interface{}
+		if err := toml.Unmarshal([]byte(tc.toml), &doc); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := pythonRuntimeDependencies(doc)["mcp-types"]; got != tc.want {
+			t.Errorf("%s: mcp-types is a runtime dependency = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

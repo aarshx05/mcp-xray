@@ -37,7 +37,38 @@ func NewSCAScanner(repoPath string, config *Config) *SCAScanner {
 }
 
 func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
-	recursiveRoots, shallowRoots := splitScanRoots(s.repoPath, s.config)
+	actions := osvscanner.ScannerActions{
+		// Scan this directory as "project source"
+		DirectoryPaths: []string{s.repoPath},
+		Recursive:      true,
+
+		// Optional: enable call/reachability analysis per ecosystem
+		// Example keys include "npm", "pypi", "go" (see osv-scanner docs)
+		// CallAnalysisStates: map[string]bool{"go": true, "npm": true, "pypi": true},
+	}
+
+	results, err := osvscanner.DoScan(actions)
+	if err != nil {
+		// Note: DoScan may return a "vulnerabilities found" error in some configs,
+		// so you might want to treat that as non-fatal and just read results.
+		log.Printf("scan error: %v", err)
+	}
+
+	// Normalize the results into a list of Findings
+	findings := FromOSV(results)
+	fmt.Printf("Found %d vulnerabilities\n", len(findings))
+
+	return findings, nil
+}
+
+// scanUnit runs SCA over a target scan's unit: the scan root minus the
+// unit's ExcludedDirs (other targets' trees). Like Scan it reads every
+// dependency file osv-scanner finds there, ExcludedPaths included, so the
+// units of a plan cover what a full-repository scan covers. Unlike Scan it
+// reports a failed osv-scanner call, and ErrUnsupportedInput when there was
+// no dependency input at all, so the unit's execution record is accurate.
+func (s *SCAScanner) scanUnit() ([]*proto.Finding, error) {
+	recursiveRoots, shallowRoots := s.unitScanRoots()
 
 	var combined models.VulnerabilityResults
 	calls, unsupported := 0, 0
@@ -69,9 +100,6 @@ func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 	if err := scanGroup(shallowRoots, false); err != nil {
 		return nil, err
 	}
-	if calls == 0 {
-		return nil, nil // the entire root is excluded; nothing to scan
-	}
 	if unsupported == calls {
 		return nil, fmt.Errorf("%w: no packages found in scan", ErrUnsupportedInput)
 	}
@@ -81,6 +109,12 @@ func (s *SCAScanner) Scan(ctx context.Context) ([]*proto.Finding, error) {
 	fmt.Printf("Found %d vulnerabilities\n", len(findings))
 
 	return findings, nil
+}
+
+// unitScanRoots splits the scan root for scanUnit, leaving out only the
+// unit's ExcludedDirs.
+func (s *SCAScanner) unitScanRoots() (recursiveRoots, shallowRoots []string) {
+	return splitScanRoots(s.repoPath, &Config{Root: s.config.Root, ExcludedDirs: s.config.ExcludedDirs})
 }
 
 // ScanRootOwnFiles runs SCA over root's own files, without descending into

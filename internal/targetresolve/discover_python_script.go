@@ -118,3 +118,20 @@ func classifyPythonScriptProject(p *Project) (Role, []string) {
 	}
 	return RoleUnrelated, nil
 }
+
+// markEmbeddedScripts sets EmbeddedScript on every manifest-less script
+// that lies inside the scan root of another project, one that
+// ownsDirectory. It runs once ownership roots are assigned.
+func markEmbeddedScripts(projects []*Project) {
+	for _, script := range projects {
+		if ownsDirectory(script) {
+			continue
+		}
+		for _, other := range projects {
+			if ownsDirectory(other) && within(script.Dir, other.ScanRoot()) {
+				script.EmbeddedScript = true
+				break
+			}
+		}
+	}
+}

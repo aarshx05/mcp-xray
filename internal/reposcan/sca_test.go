@@ -1,6 +1,7 @@
 package reposcan
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -112,6 +113,47 @@ func TestSplitScanRoots_UnreadableRootFallsBackToSingleEntry(t *testing.T) {
 	recursive, shallow := splitScanRoots(root, &Config{Root: root})
 	if len(shallow) != 0 || len(recursive) != 1 || recursive[0] != root {
 		t.Errorf("expected an unreadable root to fall back to a single recursive entry (letting osv-scanner's own os.Stat report the real error), got recursive=%v shallow=%v", recursive, shallow)
+	}
+}
+
+// A target scan's unit leaves out only other targets' trees: the default
+// excludes (build, cache, vendor, ...) never pruned the full-repository
+// dependency scan, so pruning them here would lose lockfiles a plain scan
+// reports.
+func TestUnitScanRoots_LeavesOutOnlyExcludedDirs(t *testing.T) {
+	root := t.TempDir()
+	build := filepath.Join(root, "build")
+	cache := filepath.Join(root, "tools", "cache")
+	other := filepath.Join(root, "other")
+	for _, dir := range []string{build, cache, other} {
+		mustMkdirAll(t, dir)
+	}
+	cfg := DefaultConfig()
+	cfg.Root = root
+	cfg.ExcludedPaths = append(cfg.ExcludedPaths, "tools")
+	cfg.ExcludedDirs = []string{"other"}
+
+	recursive, shallow := NewSCAScanner(root, cfg).unitScanRoots()
+
+	tools := filepath.Join(root, "tools")
+	if !contains(recursive, build) || !contains(recursive, tools) {
+		t.Errorf("recursive roots = %v, want %q and %q despite ExcludedPaths", recursive, build, tools)
+	}
+	if contains(recursive, other) || contains(shallow, other) {
+		t.Errorf("excluded dir %q was scanned: recursive=%v shallow=%v", other, recursive, shallow)
+	}
+	if !contains(shallow, root) {
+		t.Errorf("shallow roots = %v, want the root %q for its own files", shallow, root)
+	}
+}
+
+// A full-repository dependency scan with nothing to scan reports zero
+// vulnerabilities, not an error.
+func TestSCAScan_NoDependencyFilesFindsNothing(t *testing.T) {
+	root := t.TempDir()
+	findings, err := NewSCAScanner(root, &Config{Root: root}).Scan(context.Background())
+	if err != nil || len(findings) != 0 {
+		t.Errorf("Scan() = %v, %v; want no findings and no error", findings, err)
 	}
 }
 

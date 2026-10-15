@@ -53,6 +53,7 @@ func Resolve(repoRoot string) (*Resolution, error) {
 	promoteWrapperServers(projects)
 
 	components := assignIdentities(absRoot, projects)
+	markEmbeddedScripts(projects)
 	targets := buildTargets(projects)
 	targets = mergeTargetsByComponent(targets)
 	for _, target := range targets {

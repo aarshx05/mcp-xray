@@ -171,3 +171,26 @@ if __name__ == "__main__":
 		t.Fatalf("candidates = %+v, want the weather server script", projects)
 	}
 }
+
+// A Poetry project declares its package in [tool.poetry] alone, without a
+// [project] table: a script below its pyproject.toml is that package's
+// source, not a standalone server.
+func TestDiscoverLegacyPythonScripts_SkipsFileInsidePoetryProject(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[tool.poetry]\nname = \"weather\"\nversion = \"0.1.0\"\n")
+	writeFile(t, filepath.Join(root, "weather", "server.py"), `
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("weather")
+
+if __name__ == "__main__":
+    mcp.run()
+`)
+
+	projects, err := discoverLegacyPythonScripts(root)
+	if err != nil {
+		t.Fatalf("discoverLegacyPythonScripts returned error: %v", err)
+	}
+	if len(projects) != 0 {
+		t.Errorf("expected a .py file inside a Poetry project to be skipped, got %d: %+v", len(projects), projects)
+	}
+}

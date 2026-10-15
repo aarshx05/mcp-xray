@@ -44,7 +44,7 @@ func printDiscoveredTargets(targets []*targetresolve.Target, allProjects []*targ
 		if breakdown := inclusionReasonBreakdown(t); breakdown != "" {
 			fmt.Printf("     scope: %s\n", breakdown)
 		}
-		if manifests := targetresolve.DiscoveredManifests(t.ScanRoots()); len(manifests) > 0 {
+		if manifests := t.DependencyFiles(allProjects); len(manifests) > 0 {
 			fmt.Printf("     dependency files (%d):\n", len(manifests))
 			for _, m := range manifests {
 				fmt.Printf("       %s\n", displayPath(m, repoRoot))
@@ -172,12 +172,30 @@ func targetByName(targets []*targetresolve.Target, repoRoot, name string) (*targ
 }
 
 // isInteractiveTerminal reports whether stdin is a terminal a user could
-// respond to, covering both native terminals (isatty.IsTerminal) and
-// mintty/Git-Bash on Windows (isatty.IsCygwinTerminal), which IsTerminal
-// alone does not detect.
+// respond to.
 func isInteractiveTerminal() bool {
-	fd := os.Stdin.Fd()
+	return isTerminal(os.Stdin)
+}
+
+// isTerminal reports whether file is a terminal, covering both native
+// terminals (isatty.IsTerminal) and mintty/Git-Bash on Windows
+// (isatty.IsCygwinTerminal), which IsTerminal alone does not detect.
+func isTerminal(file *os.File) bool {
+	fd := file.Fd()
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
+
+// printTargetHint points a user scanning the whole repository at
+// --list-targets when it holds two or more MCP targets. Resolving them walks
+// and reads the whole repository, so the hint is only for someone watching a
+// terminal; a plain repo-scan in CI or a pipe costs what it did before.
+func printTargetHint(repoPath string) {
+	if !isTerminal(os.Stdout) {
+		return
+	}
+	if resolution, err := targetresolve.Resolve(repoPath); err == nil && len(resolution.Targets) >= 2 {
+		fmt.Printf("Detected %d MCP targets in this repository. To scan them individually instead of the whole repository, rerun with --list-targets.\n", len(resolution.Targets))
+	}
 }
 
 func promptForTarget(targets []*targetresolve.Target, allProjects []*targetresolve.Project, repoRoot string) (*targetresolve.Target, error) {

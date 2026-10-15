@@ -48,16 +48,18 @@ type AggregatedFinding struct {
 }
 
 // SARIFProperties is the attribution attached to the finding's SARIF result.
+// Its lists are never null: a repository-global finding has empty targetIds
+// and componentIds.
 func (a *AggregatedFinding) SARIFProperties() map[string]interface{} {
 	properties := map[string]interface{}{
 		"fingerprint":    a.Fingerprint,
 		"rawCount":       a.RawCount,
 		"duplicateCount": a.DuplicateCount,
-		"targetIds":      a.TargetIDs,
-		"componentIds":   a.ComponentIDs,
-		"scanUnitIds":    a.ScanUnitIDs,
-		"relations":      a.Relations,
-		"context":        a.Contexts,
+		"targetIds":      orEmpty(a.TargetIDs),
+		"componentIds":   orEmpty(a.ComponentIDs),
+		"scanUnitIds":    orEmpty(a.ScanUnitIDs),
+		"relations":      orEmpty(a.Relations),
+		"context":        orEmpty(a.Contexts),
 	}
 	if len(a.RawInstances) > 0 {
 		properties["rawInstances"] = a.RawInstances
@@ -65,9 +67,23 @@ func (a *AggregatedFinding) SARIFProperties() map[string]interface{} {
 	return properties
 }
 
+// orEmpty returns values, or an empty list, which JSON encodes as [], in
+// place of nil, which it encodes as null.
+func orEmpty(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
 // Fingerprint identifies a finding independently of which scan unit reported
-// it: the same issue at the same repository-relative location hashes the same.
-func Fingerprint(repoRoot string, finding *proto.Finding) string {
+// it: the same issue at the same repository-relative location hashes the
+// same. occurrence tells apart the findings one execution reports that are
+// otherwise identical -- gitleaks reports two secrets of one rule on one
+// line with nothing else to distinguish them -- as the number of identical
+// findings the execution reported before this one; the first one's
+// fingerprint does not depend on it.
+func Fingerprint(repoRoot string, finding *proto.Finding, occurrence int) string {
 	if finding == nil {
 		return ""
 	}
@@ -83,8 +99,11 @@ func Fingerprint(repoRoot string, finding *proto.Finding) string {
 	if message == "" {
 		message = strings.TrimSpace(finding.Title)
 	}
-	value := strings.Join([]string{finding.Tool, string(finding.Type.String()), finding.RuleId, path, formatInt(finding.Line), finding.Package, finding.Version, message}, "\x00")
-	sum := sha256.Sum256([]byte(value))
+	fields := []string{finding.Tool, string(finding.Type.String()), finding.RuleId, path, formatInt(finding.Line), finding.Package, finding.Version, message}
+	if occurrence > 0 {
+		fields = append(fields, strconv.Itoa(occurrence))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -96,14 +115,21 @@ func formatInt(value int32) string {
 }
 
 // Aggregate merges raw findings that share a Fingerprint, sorted by
-// fingerprint so the output is deterministic.
+// fingerprint so the output is deterministic. Merging removes the overlap
+// of scan units, one finding reported by several executions; the findings
+// of one execution are never merged with each other, however alike. The
+// k-th of an execution's identical findings merges with the k-th of
+// another's.
 func Aggregate(repoRoot string, inputs []AttributedFinding) []*AggregatedFinding {
 	byFingerprint := make(map[string]*AggregatedFinding)
+	occurrences := make(map[string]int) // execution ID and first-occurrence fingerprint -> findings so far
 	for _, input := range inputs {
 		if input.Finding == nil {
 			continue
 		}
-		fp := Fingerprint(repoRoot, input.Finding)
+		identity := input.ExecutionID + "\x00" + Fingerprint(repoRoot, input.Finding, 0)
+		fp := Fingerprint(repoRoot, input.Finding, occurrences[identity])
+		occurrences[identity]++
 		agg := byFingerprint[fp]
 		if agg == nil {
 			agg = &AggregatedFinding{Finding: input.Finding, Fingerprint: fp}
@@ -159,7 +185,9 @@ func appendUnique(values []string, additions ...string) []string {
 // A document is "docs" wherever it is: a markup file (.md, .rst, ...) or a
 // conventional project document (README, LICENSE, SECURITY.txt, ...) with no
 // extension or a plain-text one -- security.go and history.ts are source
-// code. Otherwise the path's DIRECTORY segments decide, so src/build.go and
+// code. An agent skill's SKILL.md is not a document but instructions the
+// project ships for an agent to act on, so it is classified like any other
+// file. Otherwise the path's DIRECTORY segments decide, so src/build.go and
 // src/tools.go are ordinary production files; when several directories are
 // tagged, the outermost one wins: vendor/x/testing/y.go is vendored code,
 // not the project's own tests. A directory is tagged only by its
@@ -172,7 +200,7 @@ func ContextForPath(repoRelativePath string) string {
 	normalized := filepath.ToSlash(filepath.Clean(repoRelativePath))
 	base := strings.ToLower(path.Base(normalized))
 	ext := path.Ext(base)
-	if markupExtensions[ext] || (plainDocumentExtensions[ext] && documentationStems[strings.TrimSuffix(base, ext)]) {
+	if (markupExtensions[ext] && base != "skill.md") || (plainDocumentExtensions[ext] && documentationStems[strings.TrimSuffix(base, ext)]) {
 		return "docs"
 	}
 
@@ -267,6 +295,7 @@ var contextDirectoryToLabel = map[string]string{
 	"scripts":          "build",
 	"script":           "build",
 	"eng":              "build",
+	".devcontainer":    "build",
 	"deploy":           "deployment",
 	"deployment":       "deployment",
 	"infra":            "deployment",

@@ -2,6 +2,7 @@ package targetresolve
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +21,28 @@ func TestTransitiveClosure(t *testing.T) {
 	}
 }
 
+// A LocalDeps entry naming a directory several projects share is the
+// project of the depending project's own ecosystem, whichever of them was
+// discovered first, and none when no project there is of its ecosystem.
+func TestProjectDirsDep_FollowsTheDependentsEcosystem(t *testing.T) {
+	node := &Project{Name: "liba", Dir: "/repo/liba", Ecosystem: "node"}
+	python := &Project{Name: "liba-py-tools", Dir: "/repo/liba", Ecosystem: "python"}
+	name := func(p *Project) string {
+		if p == nil {
+			return "none"
+		}
+		return p.Name
+	}
+	for _, discovered := range [][]*Project{{node, python}, {python, node}} {
+		dirs := indexProjectDirs(discovered)
+		for ecosystem, want := range map[string]*Project{"node": node, "python": python, "go": nil} {
+			if got := dirs.dep(&Project{Dir: "/repo/srv", Ecosystem: ecosystem}, "/repo/liba"); got != want {
+				t.Errorf("discovered %s first: a %s dependency on liba/ = %s, want %s", discovered[0].Ecosystem, ecosystem, name(got), name(want))
+			}
+		}
+	}
+}
+
 func TestTransitiveClosure_CycleSafe(t *testing.T) {
 	a := &Project{Name: "a", Dir: "/repo/a"}
 	b := &Project{Name: "b", Dir: "/repo/b"}
@@ -31,6 +54,29 @@ func TestTransitiveClosure_CycleSafe(t *testing.T) {
 	closure := transitiveClosure(a, dirs)
 	if len(closure) != 2 {
 		t.Fatalf("expected cycle-safe closure of 2, got %d: %+v", len(closure), closure)
+	}
+}
+
+// A server's own development dependencies are part of the code it is built
+// and tested with; a dependency's are never installed with it. Reproduces
+// python-sdk, whose examples depend on the SDK and the SDK's dev group on
+// an examples package.
+func TestTransitiveClosure_FollowsOnlyTheServersOwnDevelopmentDependencies(t *testing.T) {
+	server := &Project{Name: "server", Dir: "/repo/server"}
+	testkit := &Project{Name: "testkit", Dir: "/repo/testkit"}
+	sdk := &Project{Name: "sdk", Dir: "/repo"}
+	stories := &Project{Name: "stories", Dir: "/repo/stories"}
+	server.LocalDeps, server.DevLocalDeps = []string{sdk.Dir, testkit.Dir}, []string{testkit.Dir}
+	sdk.LocalDeps, sdk.DevLocalDeps = []string{stories.Dir}, []string{stories.Dir}
+
+	closure := transitiveClosure(server, indexProjectDirs([]*Project{server, testkit, sdk, stories}))
+
+	var names []string
+	for _, p := range closure {
+		names = append(names, p.Name)
+	}
+	if got, want := strings.Join(names, ","), "server,sdk,testkit"; got != want {
+		t.Errorf("closure = %s, want %s", got, want)
 	}
 }
 

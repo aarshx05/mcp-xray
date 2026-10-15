@@ -36,14 +36,14 @@ func TestLockfileRecognitionIsConsistent(t *testing.T) {
 	}
 }
 
-func TestDiscoveredManifests_IncludesUvLock(t *testing.T) {
+func TestDependencyFiles_IncludesUvLock(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"x\"\n")
 	writeFile(t, filepath.Join(root, "uv.lock"), "version = 1\n")
 
-	found := DiscoveredManifests([]string{root})
+	found := dependencyFilesOf(root)
 	want := []string{filepath.Join(root, "pyproject.toml"), filepath.Join(root, "uv.lock")}
 	if len(found) != len(want) || found[0] != want[0] || found[1] != want[1] {
-		t.Fatalf("DiscoveredManifests = %v, want %v", found, want)
+		t.Fatalf("DependencyFiles = %v, want %v", found, want)
 	}
 }

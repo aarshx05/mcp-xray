@@ -46,41 +46,55 @@ func TestProjectScanRoot(t *testing.T) {
 	}
 }
 
-func TestDiscoveredManifests_FindsKnownManifestsAndLockfiles(t *testing.T) {
+// dependencyFilesOf is the dependency files of a target whose one project
+// is rooted at root.
+func dependencyFilesOf(root string, allProjects ...*Project) []string {
+	project := &Project{ID: "p", Dir: root, OwnershipRoot: root}
+	return (&Target{Project: project, Included: []*Project{project}}).DependencyFiles(append(allProjects, project))
+}
+
+func TestDependencyFiles_FindsKnownManifestsAndLockfiles(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "package.json"), `{"name": "x"}`)
 	writeFile(t, filepath.Join(root, "package-lock.json"), `{}`)
 	writeFile(t, filepath.Join(root, "README.md"), "not a manifest")
 
-	found := DiscoveredManifests([]string{root})
+	found := dependencyFilesOf(root)
 	if len(found) != 2 {
 		t.Fatalf("expected 2 manifest/lockfile matches (README.md excluded), got %d: %v", len(found), found)
 	}
 }
 
-func TestDiscoveredManifests_PrunesDefaultExcludes(t *testing.T) {
+func TestDependencyFiles_PrunesDefaultExcludes(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "some-dep", "package.json"), `{"name": "dep"}`)
 	writeFile(t, filepath.Join(root, "package.json"), `{"name": "x"}`)
 
-	found := DiscoveredManifests([]string{root})
+	found := dependencyFilesOf(root)
 	if len(found) != 1 {
 		t.Fatalf("expected node_modules to be pruned by the default excludes, leaving 1 manifest, got %d: %v", len(found), found)
 	}
 }
 
-func TestDiscoveredManifests_DedupesOverlappingRoots(t *testing.T) {
+// A discovered project nested in the target's directory that the target
+// does not include is left out of its scan, so its dependency files are not
+// listed as the target's.
+func TestDependencyFiles_LeavesOutNestedProjectsTheTargetExcludes(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "go.mod"), "module example.com/x\n")
+	writeFile(t, filepath.Join(root, "tools", "helper", "package.json"), `{"name": "helper"}`)
+	writeFile(t, filepath.Join(root, "tools", "helper", "package-lock.json"), `{}`)
+	helperDir := filepath.Join(root, "tools", "helper")
+	helper := &Project{ID: "p-helper", Dir: helperDir, OwnershipRoot: helperDir}
 
-	found := DiscoveredManifests([]string{root, root})
-	if len(found) != 1 {
-		t.Fatalf("expected exactly 1 result despite duplicate/overlapping roots, got %d: %v", len(found), found)
+	found := dependencyFilesOf(root, helper)
+	if len(found) != 1 || found[0] != filepath.Join(root, "go.mod") {
+		t.Errorf("DependencyFiles = %v, want only the target's own go.mod", found)
 	}
 }
 
-func TestDiscoveredManifests_NoRootsFindsNothing(t *testing.T) {
-	if found := DiscoveredManifests(nil); len(found) != 0 {
+func TestDependencyFiles_NoScanRootsFindsNothing(t *testing.T) {
+	if found := (&Target{}).DependencyFiles(nil); len(found) != 0 {
 		t.Errorf("expected no roots to find nothing, got %v", found)
 	}
 }

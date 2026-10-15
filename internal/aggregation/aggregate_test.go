@@ -1,7 +1,11 @@
 package aggregation
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"mcpxray/proto"
@@ -11,8 +15,8 @@ func TestAggregateExactDuplicateKeepsAffectedTargets(t *testing.T) {
 	root := t.TempDir()
 	finding := &proto.Finding{Tool: "sast", Type: proto.FindingType_FINDING_TYPE_SAST, RuleId: "unsafe", File: filepath.Join(root, "shared", "util.go"), Line: 7, Message: "danger"}
 	items := Aggregate(root, []AttributedFinding{
-		{Finding: finding, TargetIDs: []string{"target-a"}, ScanUnitID: "scan-shared", Relation: "shared"},
-		{Finding: finding, TargetIDs: []string{"target-b"}, ScanUnitID: "scan-shared", Relation: "shared"},
+		{Finding: finding, TargetIDs: []string{"target-a"}, ScanUnitID: "scan-a", ExecutionID: "exec-a", Relation: "shared"},
+		{Finding: finding, TargetIDs: []string{"target-b"}, ScanUnitID: "scan-b", ExecutionID: "exec-b", Relation: "shared"},
 	})
 	if len(items) != 1 {
 		t.Fatalf("aggregated findings = %d, want 1", len(items))
@@ -40,11 +44,65 @@ func TestFingerprintSeparatesPackagesAndRegions(t *testing.T) {
 	otherPackage.Package = "b"
 	otherLine := newFinding()
 	otherLine.Line = 2
-	if Fingerprint(root, base) == Fingerprint(root, otherPackage) {
+	if Fingerprint(root, base, 0) == Fingerprint(root, otherPackage, 0) {
 		t.Error("different package instances must not share a fingerprint")
 	}
-	if Fingerprint(root, base) == Fingerprint(root, otherLine) {
+	if Fingerprint(root, base, 0) == Fingerprint(root, otherLine, 0) {
 		t.Error("different regions must not share a fingerprint")
+	}
+	if Fingerprint(root, base, 0) == Fingerprint(root, base, 1) {
+		t.Error("different occurrences must not share a fingerprint")
+	}
+}
+
+// A first occurrence hashes the finding's own fields alone, so a finding no
+// execution repeats keeps the fingerprint it had before occurrences were
+// counted, and a consumer tracking findings by fingerprint across reports
+// still recognizes it.
+func TestFingerprintOfAFirstOccurrenceHashesTheFindingAlone(t *testing.T) {
+	root := t.TempDir()
+	finding := &proto.Finding{Tool: "osv", Type: proto.FindingType_FINDING_TYPE_SCA, RuleId: "CVE-1", File: filepath.Join(root, "package-lock.json"), Package: "a", Version: "1", Message: "issue"}
+	// tool, type, rule, path, line (none), package, version, message
+	sum := sha256.Sum256([]byte(strings.Join([]string{"osv", "FINDING_TYPE_SCA", "CVE-1", "package-lock.json", "", "a", "1", "issue"}, "\x00")))
+	if got, want := Fingerprint(root, finding, 0), hex.EncodeToString(sum[:16]); got != want {
+		t.Errorf("Fingerprint = %s, want %s", got, want)
+	}
+}
+
+// gitleaks reports two different secrets of one rule on one line as two
+// findings nothing else tells apart. They stay two findings, and when an
+// overlapping unit reports them too, each merges with its counterpart.
+func TestAggregateKeepsOneExecutionsIdenticalFindingsApart(t *testing.T) {
+	root := t.TempDir()
+	newFinding := func() *proto.Finding {
+		return &proto.Finding{Tool: "gitleaks", Type: proto.FindingType_FINDING_TYPE_SECRETS, RuleId: "aws-access-token", File: filepath.Join(root, "app", "keys.js"), Line: 3, Message: "AWS access token"}
+	}
+	first, second := newFinding(), newFinding()
+	inputs := []AttributedFinding{
+		{Finding: first, TargetIDs: []string{"t1"}, ScanUnitID: "su-1", ExecutionID: "exec-1"},
+		{Finding: second, TargetIDs: []string{"t1"}, ScanUnitID: "su-1", ExecutionID: "exec-1"},
+	}
+	items := Aggregate(root, inputs)
+	if len(items) != 2 || items[0].RawCount != 1 || items[1].RawCount != 1 {
+		t.Fatalf("one execution's two identical findings aggregated to %d items, want 2 with one raw instance each", len(items))
+	}
+
+	inputs = append(inputs,
+		AttributedFinding{Finding: newFinding(), TargetIDs: []string{"t2"}, ScanUnitID: "su-2", ExecutionID: "exec-2"},
+		AttributedFinding{Finding: newFinding(), TargetIDs: []string{"t2"}, ScanUnitID: "su-2", ExecutionID: "exec-2"},
+	)
+	items = Aggregate(root, inputs)
+	if len(items) != 2 {
+		t.Fatalf("two executions' identical pairs aggregated to %d items, want 2", len(items))
+	}
+	fingerprints := map[string]bool{Fingerprint(root, first, 0): true, Fingerprint(root, first, 1): true}
+	for _, item := range items {
+		if item.RawCount != 2 || item.DuplicateCount != 1 || len(item.TargetIDs) != 2 {
+			t.Errorf("item %+v, want one raw instance from each execution, crediting both targets", item)
+		}
+		if !fingerprints[item.Fingerprint] {
+			t.Errorf("fingerprint %q is neither occurrence's", item.Fingerprint)
+		}
 	}
 }
 
@@ -185,7 +243,12 @@ func TestContextForPath_DocumentsTestFilesAndNamespaces(t *testing.T) {
 		path string
 		want string
 	}{
-		{"src/server/SKILL.md", "docs"},
+		{"src/server/USAGE.md", "docs"},
+		// An agent skill is shipped instructions, not documentation.
+		{"skills/stripe-directory/SKILL.md", "production"},
+		{"plugins/cli/skills/sentry-cli/SKILL.md", "production"},
+		{"docs/skills/example/SKILL.md", "docs"},
+		{".devcontainer/devcontainer.json", "build"},
 		{"packages/core/guide.mdx", "docs"},
 		{"tests/README.md", "docs"},
 		{"requirements.txt", "production"},
@@ -201,6 +264,7 @@ func TestContextForPath_DocumentsTestFilesAndNamespaces(t *testing.T) {
 		{"examples/demo_test.go", "example"},
 		{"tools/Azure.Mcp.Tools.Foo/tests/Azure.Mcp.Tools.Foo.Tests/FooTests.cs", "test"},
 		{"src/Foo.UnitTests/BarTests.cs", "test"},
+		{"src/Foo.Tests/BarTests.cs", "test"},
 		{"src/Options/Docs/DocsGetOptions.cs", "production"},
 		{"src/Webapp/Deployment/DeploymentGetCommand.cs", "production"},
 		{"src/e2e/flow.ts", "test"},
@@ -237,8 +301,8 @@ func TestAggregateCollectsAllRelationsAndContexts(t *testing.T) {
 	root := t.TempDir()
 	finding := &proto.Finding{Tool: "sast", Type: proto.FindingType_FINDING_TYPE_SAST, RuleId: "r1", File: filepath.Join(root, "shared", "f.go"), Message: "x"}
 	items := Aggregate(root, []AttributedFinding{
-		{Finding: finding, TargetIDs: []string{"t1"}, ScanUnitID: "su-1", Relation: "direct", Context: "production"},
-		{Finding: finding, TargetIDs: []string{"t2"}, ScanUnitID: "su-2", Relation: "shared", Context: "test"},
+		{Finding: finding, TargetIDs: []string{"t1"}, ScanUnitID: "su-1", ExecutionID: "exec-1", Relation: "direct", Context: "production"},
+		{Finding: finding, TargetIDs: []string{"t2"}, ScanUnitID: "su-2", ExecutionID: "exec-2", Relation: "shared", Context: "test"},
 	})
 	if len(items) != 1 {
 		t.Fatalf("aggregated = %d, want 1", len(items))
@@ -275,5 +339,22 @@ func TestSARIFProperties(t *testing.T) {
 	item.RawInstances = []RawInstance{{ScanUnitID: "scan-a", ExecutionID: "exec-1", Scanner: "sast"}}
 	if instances, ok := item.SARIFProperties()["rawInstances"].([]RawInstance); !ok || len(instances) != 1 {
 		t.Errorf("rawInstances = %v, want the one raw instance", item.SARIFProperties()["rawInstances"])
+	}
+}
+
+// A repository-global finding belongs to no target or component; its SARIF
+// result says so with empty lists, not nulls.
+func TestSARIFPropertiesEncodeEmptyListsAsArrays(t *testing.T) {
+	data, err := json.Marshal((&AggregatedFinding{Fingerprint: "fp", RawCount: 1, ScanUnitIDs: []string{"scan-global"}, Relations: []string{"repository-global"}, Contexts: []string{"ci"}}).SARIFProperties())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"targetIds":[]`, `"componentIds":[]`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("SARIF properties %s lack %s", data, want)
+		}
+	}
+	if strings.Contains(string(data), "null") {
+		t.Errorf("SARIF properties %s hold a null", data)
 	}
 }

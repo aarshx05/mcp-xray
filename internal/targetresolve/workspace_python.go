@@ -287,12 +287,25 @@ func addPythonLocalDep(p, dep *Project, devOnly bool) {
 
 // pythonRuntimeDependencies returns the PEP 503 names of the distributions
 // a project needs to run: [project].dependencies and optional-dependencies,
-// and Poetry's main dependency table. Dependency groups are development
+// and Poetry's main dependency table. A project that declares its
+// dependencies dynamic lists them in a Hatch metadata hook instead
+// (uv-dynamic-versioning's pins a workspace sibling to the package's own
+// version: "mcp-types=={{ version }}"). Dependency groups are development
 // only: they are never installed with the package.
 func pythonRuntimeDependencies(doc map[string]interface{}) map[string]bool {
 	runtime := make(map[string]bool)
 	if deps, ok := valueAt(doc, "project", "dependencies"); ok {
 		addPEP508Names(runtime, deps)
+	}
+	dynamic, _ := valueAt(doc, "project", "dynamic")
+	if fields, _ := dynamic.([]interface{}); slices.Contains(fields, interface{}("dependencies")) {
+		if hooks, ok := mapAt(doc, "tool", "hatch", "metadata", "hooks"); ok {
+			for _, hook := range hooks {
+				if hook, ok := hook.(map[string]interface{}); ok {
+					addPEP508Names(runtime, hook["dependencies"])
+				}
+			}
+		}
 	}
 	if extras, ok := mapAt(doc, "project", "optional-dependencies"); ok {
 		for _, deps := range extras {

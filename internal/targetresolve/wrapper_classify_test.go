@@ -210,7 +210,9 @@ func TestHasWorkerEntrypoint(t *testing.T) {
 func TestNodeScriptStartsServer(t *testing.T) {
 	const server = "import { serveStdio } from \"@modelcontextprotocol/server/stdio\";\nvoid serveStdio(buildServer);\n"
 	const client = "import { Client } from \"@modelcontextprotocol/client\";\nawait client.connect(transport);\n"
-	const library = "import { McpServer } from \"@modelcontextprotocol/server\";\nexport const start = (s, t) => s.connect(t);\n"
+	// A build entry can start a server too; what tells it apart is that
+	// esbuild bundles it rather than runs it.
+	const library = "import { McpServer } from \"@modelcontextprotocol/server\";\nexport const start = (s, transport) => s.connect(transport);\n"
 	cases := []struct {
 		name, scripts string
 		want          bool

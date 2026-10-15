@@ -23,18 +23,20 @@ func (t *Target) ScanRoots() []string {
 	return dropNestedRoots(dirs)
 }
 
-// DiscoveredManifests returns every dependency manifest and lockfile under
-// roots (typically a Target's ScanRoots), sorted and deduplicated. It is
-// informational, for --list-targets: the SCA scanner finds manifests itself
-// inside the directories it is given.
-func DiscoveredManifests(roots []string) []string {
+// DependencyFiles returns, sorted, every dependency manifest and lockfile a
+// scan of t alone reads under its ScanRoots: the ones in a discovered
+// project (of allProjects) nested there that t does not include are left
+// out, as its scan units leave that project out (nestedForeignExcludes). It
+// is informational, for --list-targets: the SCA scanner finds manifests
+// itself inside the directories it is given.
+func (t *Target) DependencyFiles(allProjects []*Project) []string {
+	included := includedScanRoots([]*Target{t})
 	var found []string
-	seen := make(map[string]bool)
-	for _, root := range roots {
-		_ = walkFiles(root, nil, func(path string, info os.FileInfo) error {
-			if cleaned := filepath.Clean(path); matchesAnyManifestPattern(info.Name()) && !seen[cleaned] {
-				seen[cleaned] = true
-				found = append(found, cleaned)
+	for _, root := range t.ScanRoots() {
+		unit := &ScanUnit{Root: root, ExcludedDirs: nestedForeignExcludes(root, included, allProjects)} // as a plan of t alone has it
+		_ = walkFiles(root, func(dir string) bool { return isExcludedFromUnit(unit, dir) }, func(path string, info os.FileInfo) error {
+			if matchesAnyManifestPattern(info.Name()) {
+				found = append(found, filepath.Clean(path))
 			}
 			return nil
 		})
@@ -81,8 +83,8 @@ func nestedForeignExcludes(unitRoot string, includedRoots map[string]bool, allPr
 	seen := make(map[string]bool)
 	for _, p := range allProjects {
 		root := p.ScanRoot()
-		if root == cleanUnitRoot || includedRoots[root] || !within(root, cleanUnitRoot) || enclosesAny(root, includedRoots) {
-			continue
+		if p.EmbeddedScript || root == cleanUnitRoot || includedRoots[root] || !within(root, cleanUnitRoot) || enclosesAny(root, includedRoots) {
+			continue // an embedded script's directory is the enclosing project's too
 		}
 		if !seen[root] {
 			seen[root] = true

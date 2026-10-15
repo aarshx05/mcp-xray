@@ -11,7 +11,10 @@
 // to the resolution algorithm itself.
 package targetresolve
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"strings"
+)
 
 // Role classifies what a discovered project actually is with respect to MCP.
 type Role string
@@ -108,6 +111,10 @@ type Project struct {
 	// this project (go.mod, package.json, pyproject.toml).
 	ManifestPath string
 
+	// EmbeddedScript marks a manifest-less Python script that lies inside
+	// another project's scan root (markEmbeddedScripts); see claims.
+	EmbeddedScript bool
+
 	// Role is the classification assigned by signals.go.
 	Role Role
 
@@ -170,6 +177,22 @@ func (p *Project) ScanRoot() string {
 		return filepath.Clean(p.OwnershipRoot)
 	}
 	return filepath.Clean(p.Dir)
+}
+
+// claims reports whether the file at path is one of p's own: it lies under
+// p's scan root, and, for an EmbeddedScript, is Python source or a
+// requirements file. The other files around an embedded script are the
+// enclosing project's, as a Node server's src/ holding a Python smoke-test
+// client is still the server's source.
+func (p *Project) claims(path string) bool {
+	if !within(path, p.ScanRoot()) {
+		return false
+	}
+	if !p.EmbeddedScript {
+		return true
+	}
+	name := filepath.Base(path)
+	return strings.HasSuffix(name, ".py") || (strings.HasPrefix(name, "requirements") && strings.HasSuffix(name, ".txt"))
 }
 
 // InclusionReason explains why a project appears in a Target's Included set.

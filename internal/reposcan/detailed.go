@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"time"
 
@@ -18,10 +19,13 @@ const (
 	ScannerFailed      ScannerStatus = "failed"
 	ScannerSkipped     ScannerStatus = "skipped"
 	ScannerUnsupported ScannerStatus = "unsupported"
+	// ScannerPartial is a run of which a part failed (a SAST taint engine),
+	// recorded with the findings of the parts that succeeded.
+	ScannerPartial ScannerStatus = "partial"
 )
 
 // ScannerExecution records one scanner run over one scan unit. A failed run
-// is never reported as zero findings.
+// is never reported as zero findings, nor a partial one as a success.
 type ScannerExecution struct {
 	ID           string        `json:"id"`
 	ScanUnitID   string        `json:"scanUnitId"`
@@ -57,14 +61,29 @@ func executionID(scanUnitID, scanner string) string {
 // ScanDetailed runs the selected scanners over one scan unit, recording an
 // execution per scanner (skipped ones included) and each finding's
 // execution. Successful raw findings are returned unchanged apart from a
-// scan-root-relative file, which is made absolute (see run).
+// relative file (a taint finding's, relative to config.ReportRoot or else
+// root), which is made absolute (see run).
 func ScanDetailed(ctx context.Context, root string, config *Config, selection ScannerSelection, scanUnitID string, inputSummary string) DetailedScanResult {
+	reportRoot := root
+	if config.ReportRoot != "" {
+		reportRoot = config.ReportRoot
+	}
 	var result DetailedScanResult
-	result.run(root, scanUnitID, "osv", inputSummary, selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).Scan(ctx) })
-	result.run(root, scanUnitID, "gitleaks", inputSummary, selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
-	result.run(root, scanUnitID, "sast", inputSummary, selection.SAST, func() ([]*proto.Finding, error) { return NewSASTScanner(root, config).Scan(ctx) })
+	result.run(reportRoot, scanUnitID, "osv", inputSummary, selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).scanUnit() })
+	result.run(reportRoot, scanUnitID, "gitleaks", inputSummary, selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
+	result.run(reportRoot, scanUnitID, "sast", inputSummary, selection.SAST, func() ([]*proto.Finding, error) {
+		findings, taintErr, err := NewSASTScanner(root, config).scan(ctx)
+		if err == nil && taintErr != nil {
+			err = partialScanError{taintErr}
+		}
+		return findings, err
+	})
 	return result
 }
+
+// partialScanError is the error of a scan that completed in part; the
+// findings returned with it are those of the parts that succeeded.
+type partialScanError struct{ error }
 
 // ScanRootOwnFilesDetailed is ScanRootOwnFiles recorded as one osv
 // execution of scanUnitID.
@@ -74,13 +93,11 @@ func ScanRootOwnFilesDetailed(root, scanUnitID, inputSummary string) DetailedSca
 	return result
 }
 
-// run executes one scanner over root when enabled and records its execution,
-// and the execution of each finding it reports. Some scanners (the taint
-// engines) report a file relative to the directory they scanned; run makes
-// every finding's file absolute, so it can be located and attributed. A
-// taint finding's message still names the sink relative to that directory,
-// so its fingerprint depends on the scan root.
-func (r *DetailedScanResult) run(root, scanUnitID, scanner, inputSummary string, enabled bool, scan func() ([]*proto.Finding, error)) {
+// run executes one scanner when enabled and records its execution, and the
+// execution of each finding it reports. Some scanners (the taint engines)
+// report a file relative to reportRoot; run makes every finding's file
+// absolute, so it can be located and attributed.
+func (r *DetailedScanResult) run(reportRoot, scanUnitID, scanner, inputSummary string, enabled bool, scan func() ([]*proto.Finding, error)) {
 	execution := ScannerExecution{ID: executionID(scanUnitID, scanner), ScanUnitID: scanUnitID, Scanner: scanner, Status: ScannerSkipped, InputSummary: inputSummary}
 	if enabled {
 		start := time.Now()
@@ -89,13 +106,17 @@ func (r *DetailedScanResult) run(root, scanUnitID, scanner, inputSummary string,
 		switch {
 		case IsUnsupportedScanError(err):
 			execution.Status, execution.Error = ScannerUnsupported, err.Error()
-		case err != nil:
+		case err != nil && !errors.As(err, new(partialScanError)):
 			execution.Status, execution.Error = ScannerFailed, err.Error()
 		default:
+			// A partial run's findings stand like a successful run's.
 			execution.Status, execution.FindingCount = ScannerSuccess, len(findings)
+			if err != nil {
+				execution.Status, execution.Error = ScannerPartial, err.Error()
+			}
 			for _, finding := range findings {
 				if finding.File != "" && !filepath.IsAbs(finding.File) {
-					finding.File = filepath.Join(root, finding.File)
+					finding.File = filepath.Join(reportRoot, finding.File)
 				}
 				r.Findings = append(r.Findings, ExecutedFinding{Finding: finding, ExecutionID: execution.ID})
 			}

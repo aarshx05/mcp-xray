@@ -3,6 +3,7 @@ package targetresolve
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 )
 
 // buildTargets computes, for every RoleMCPServer project, the transitive
@@ -241,8 +242,11 @@ func mergeTargetsByComponent(targets []*Target) []*Target {
 }
 
 // transitiveClosure returns p plus every project reachable from p by
-// following LocalDeps edges. Cycle-safe: a dependency cycle simply stops
-// expanding once every reachable project has been visited once.
+// following LocalDeps edges: all of p's own, development ones included (the
+// code p is built and tested with), but only the runtime ones of the
+// projects p depends on, whose development dependencies are never installed
+// with them. Cycle-safe: a dependency cycle simply stops expanding once
+// every reachable project has been visited once.
 func transitiveClosure(p *Project, dirs projectDirs) []*Project {
 	visited := make(map[*Project]bool)
 	var order []*Project
@@ -255,6 +259,9 @@ func transitiveClosure(p *Project, dirs projectDirs) []*Project {
 		visited[cur] = true
 		order = append(order, cur)
 		for _, depDir := range cur.LocalDeps {
+			if cur != p && slices.Contains(cur.DevLocalDeps, depDir) {
+				continue
+			}
 			if dep := dirs.dep(cur, depDir); dep != nil {
 				visit(dep)
 			}

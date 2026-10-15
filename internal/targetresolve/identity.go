@@ -183,7 +183,10 @@ func ResolutionJSON(r *Resolution) ([]byte, error) {
 		Inventory  []InventoryEntry `json:"inventory"`
 		Excluded   []string         `json:"excluded,omitempty"`
 		Warnings   []string         `json:"warnings,omitempty"`
-	}{RepoRoot: ".", Inventory: r.Inventory, Excluded: r.Excluded, Warnings: r.Warnings}
+	}{RepoRoot: ".", Projects: []projectView{}, Components: []componentView{}, Targets: []targetView{}, Inventory: r.Inventory, Excluded: r.Excluded, Warnings: r.Warnings}
+	if view.Inventory == nil {
+		view.Inventory = []InventoryEntry{} // a consumer iterates these lists: an empty one is [], not null
+	}
 	for _, p := range r.Projects {
 		manifest := ""
 		if p.ManifestPath != "" {

@@ -449,9 +449,9 @@ fn main() {
 // TestResolve_NestedManifestReachesScanRoot proves regression requirement 3:
 // a nested manifest+lockfile physically inside the primary server's own
 // directory tree, with no LocalDeps edge of its own, does not fragment
-// ScanRoots() into a narrower scope -- the ancestor root SCA is handed
-// already covers it via the scanner's own recursive walk (see the plan's
-// grounding: internal/reposcan/sca.go passes Recursive:true).
+// ScanRoots() into a narrower scope. The nested manifest makes it a project
+// of its own, which the server does not include, so the server's scan
+// leaves it out and does not list its dependency files.
 func TestResolve_NestedManifestReachesScanRoot(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "server", "go.mod"), `module example.com/server
@@ -485,14 +485,10 @@ func main() { _ = mcp.NewServer(nil, nil) }
 		t.Errorf("expected the nested manifest's directory %q to be covered by scan root %q (the input contract the SCA scanner's own recursive walk depends on)", nestedManifestDir, roots[0])
 	}
 
-	found := false
-	for _, m := range DiscoveredManifests(roots) {
-		if filepath.Base(m) == "package.json" {
-			found = true
+	for _, m := range resolution.Targets[0].DependencyFiles(resolution.Projects) {
+		if filepath.Dir(m) == nestedManifestDir {
+			t.Errorf("DependencyFiles lists %s, which belongs to the nested project the server's scan leaves out", m)
 		}
-	}
-	if !found {
-		t.Errorf("expected DiscoveredManifests to surface the nested package.json")
 	}
 }
 
@@ -609,10 +605,16 @@ func TestResolve_DependencyOnSharedDirectoryFollowsOwnEcosystem(t *testing.T) {
 	if strings.Join(included, ",") != "srv,liba,libb" {
 		t.Errorf("srv includes %v, want srv, liba and libb", included)
 	}
+	byName := make(map[string]*Project)
 	for _, p := range resolution.Projects {
+		byName[p.Name] = p
 		if p.Name == "liba-py-tools" && (p.Role != RoleUnrelated || len(p.Evidence) != 0) {
 			t.Errorf("liba-py-tools role = %v, evidence = %v; want unrelated, referenced by nothing", p.Role, p.Evidence)
 		}
+	}
+	// The listing's stable-ID edges name the same project.
+	if got, want := strings.Join(byName["srv"].LocalDepIDs, ","), byName["liba"].ID; got != want {
+		t.Errorf("srv LocalDepIDs = %s, want only liba's %s", got, want)
 	}
 }
 
