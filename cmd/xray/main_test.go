@@ -23,6 +23,9 @@ func TestReadTargetFlags(t *testing.T) {
 		{name: "--list-targets enables target resolution without selecting", args: []string{"--list-targets"}, wantEnabled: true},
 		{name: "--list-targets --json is accepted", args: []string{"--list-targets", "--json"}, wantEnabled: true},
 		{name: "--explain-scope enables target resolution without selecting", args: []string{"--explain-scope"}, wantEnabled: true},
+		{name: "--include-repo-global enables target resolution without selecting", args: []string{"--include-repo-global"}, wantEnabled: true},
+		{name: "--target-resolution enables target resolution without selecting", args: []string{"--target-resolution"}, wantEnabled: true},
+		{name: "--output-dir alone keeps the full-repository scan", args: []string{"--output-dir", "out"}},
 		{name: "--json needs --list-targets", args: []string{"--json"}, wantErrSubstr: "--json requires --list-targets"},
 	}
 	for _, tc := range cases {
@@ -52,9 +55,8 @@ func TestReadTargetFlags(t *testing.T) {
 }
 
 // TestAttribute credits a finding to the targets its file's ownership names,
-// and leaves a file the plan does not know about unowned -- which is how
-// scanPlan keeps only the registered fallback lockfiles from the
-// workspace-root dependency check.
+// and leaves a file no target owns unowned, which ownedByATarget then drops
+// from the workspace-root dependency check.
 func TestAttribute(t *testing.T) {
 	repoRoot := t.TempDir()
 	plan := &targetresolve.ScanPlan{
@@ -82,7 +84,11 @@ func TestAttribute(t *testing.T) {
 		t.Errorf("TargetIDs = %v, want both t-a and t-b", af.TargetIDs)
 	}
 
-	if af := attribute(plan, unregistered, "workspace-root-fallback", ""); len(af.TargetIDs) != 0 {
-		t.Errorf("a file with no ownership record was credited to %v", af.TargetIDs)
+	unowned := attribute(plan, unregistered, "workspace-root-fallback", "")
+	if len(unowned.TargetIDs) != 0 {
+		t.Errorf("a file with no ownership record was credited to %v", unowned.TargetIDs)
+	}
+	if !ownedByATarget(af) || ownedByATarget(unowned) {
+		t.Error("ownedByATarget must keep the fallback lockfile's finding and drop the unowned one")
 	}
 }

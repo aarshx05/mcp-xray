@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
 	"time"
 
 	"mcpxray/proto"
@@ -26,7 +27,7 @@ type ScannerExecution struct {
 	ScanUnitID   string        `json:"scanUnitId"`
 	Scanner      string        `json:"scanner"`
 	Status       ScannerStatus `json:"status"`
-	FindingCount int           `json:"findingCount"`
+	FindingCount int           `json:"findingCount"` // as reported by the scanner, before attribution
 	InputSummary string        `json:"inputSummary,omitempty"`
 	DurationMs   int64         `json:"durationMs,omitempty"`
 	Error        string        `json:"error,omitempty"`
@@ -55,12 +56,13 @@ func executionID(scanUnitID, scanner string) string {
 
 // ScanDetailed runs the selected scanners over one scan unit, recording an
 // execution per scanner (skipped ones included) and each finding's
-// execution. Successful raw findings are returned unchanged.
+// execution. Successful raw findings are returned unchanged apart from a
+// scan-root-relative file, which is made absolute (see run).
 func ScanDetailed(ctx context.Context, root string, config *Config, selection ScannerSelection, scanUnitID string, inputSummary string) DetailedScanResult {
 	var result DetailedScanResult
-	result.run(scanUnitID, "osv", inputSummary, selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).Scan(ctx) })
-	result.run(scanUnitID, "gitleaks", inputSummary, selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
-	result.run(scanUnitID, "sast", inputSummary, selection.SAST, func() ([]*proto.Finding, error) { return NewSASTScanner(root, config).Scan(ctx) })
+	result.run(root, scanUnitID, "osv", inputSummary, selection.SCA, func() ([]*proto.Finding, error) { return NewSCAScanner(root, config).Scan(ctx) })
+	result.run(root, scanUnitID, "gitleaks", inputSummary, selection.Secrets, func() ([]*proto.Finding, error) { return NewSecretsScanner(root, config).Scan(ctx) })
+	result.run(root, scanUnitID, "sast", inputSummary, selection.SAST, func() ([]*proto.Finding, error) { return NewSASTScanner(root, config).Scan(ctx) })
 	return result
 }
 
@@ -68,13 +70,17 @@ func ScanDetailed(ctx context.Context, root string, config *Config, selection Sc
 // execution of scanUnitID.
 func ScanRootOwnFilesDetailed(root, scanUnitID, inputSummary string) DetailedScanResult {
 	var result DetailedScanResult
-	result.run(scanUnitID, "osv", inputSummary, true, func() ([]*proto.Finding, error) { return ScanRootOwnFiles(root) })
+	result.run(root, scanUnitID, "osv", inputSummary, true, func() ([]*proto.Finding, error) { return ScanRootOwnFiles(root) })
 	return result
 }
 
-// run executes one scanner when enabled and records its execution, and the
-// execution of each finding it reports.
-func (r *DetailedScanResult) run(scanUnitID, scanner, inputSummary string, enabled bool, scan func() ([]*proto.Finding, error)) {
+// run executes one scanner over root when enabled and records its execution,
+// and the execution of each finding it reports. Some scanners (the taint
+// engines) report a file relative to the directory they scanned; run makes
+// every finding's file absolute, so it can be located and attributed. A
+// taint finding's message still names the sink relative to that directory,
+// so its fingerprint depends on the scan root.
+func (r *DetailedScanResult) run(root, scanUnitID, scanner, inputSummary string, enabled bool, scan func() ([]*proto.Finding, error)) {
 	execution := ScannerExecution{ID: executionID(scanUnitID, scanner), ScanUnitID: scanUnitID, Scanner: scanner, Status: ScannerSkipped, InputSummary: inputSummary}
 	if enabled {
 		start := time.Now()
@@ -88,6 +94,9 @@ func (r *DetailedScanResult) run(scanUnitID, scanner, inputSummary string, enabl
 		default:
 			execution.Status, execution.FindingCount = ScannerSuccess, len(findings)
 			for _, finding := range findings {
+				if finding.File != "" && !filepath.IsAbs(finding.File) {
+					finding.File = filepath.Join(root, finding.File)
+				}
 				r.Findings = append(r.Findings, ExecutedFinding{Finding: finding, ExecutionID: execution.ID})
 			}
 		}

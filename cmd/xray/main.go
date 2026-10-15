@@ -267,12 +267,12 @@ func NewRepoScanCommand() *cobra.Command {
 
 			if targets.enabled {
 				output := reportOutput{path: outputPath, upload: upload, cleanup: cleanup}
-				scanned, err := runTargetScan(ctx, repoPath, targets, *config, reposcan.ScannerSelection{SCA: runCVE, Secrets: runSecrets, SAST: runSAST}, output)
+				handled, err := runTargetScan(ctx, repoPath, targets, *config, reposcan.ScannerSelection{SCA: runCVE, Secrets: runSecrets, SAST: runSAST}, output)
 				if err != nil {
 					fmt.Println(err)
 					os.Exit(1)
 				}
-				if scanned {
+				if handled {
 					return
 				}
 				fmt.Println("No MCP target detected; scanning the full repository")
@@ -356,9 +356,10 @@ func NewRepoScanCommand() *cobra.Command {
 	return cmd
 }
 
-// targetFlags is the target-resolution part of a repo-scan invocation. Any
-// target flag switches repo-scan from scanning the whole repository to
-// scanning selected MCP targets.
+// targetFlags is the target-resolution part of a repo-scan invocation.
+// --target-resolution, --list-targets, a target selection,
+// --include-repo-global or --explain-scope switches repo-scan from scanning
+// the whole repository to scanning selected MCP targets.
 type targetFlags struct {
 	enabled           bool
 	list, json        bool
@@ -404,9 +405,9 @@ type reportOutput struct {
 // runTargetScan carries out a target-resolution repo-scan: resolve the
 // repository's MCP targets, list them or plan a scan of the selected ones,
 // scan each scan unit once, and write one deduplicated SARIF report.
-// scanned is false when the repository has no MCP target and none was
+// handled is false when the repository has no MCP target and none was
 // explicitly requested, leaving the caller to scan the whole repository.
-func runTargetScan(ctx context.Context, repoPath string, targets targetFlags, base reposcan.Config, selection reposcan.ScannerSelection, output reportOutput) (scanned bool, err error) {
+func runTargetScan(ctx context.Context, repoPath string, targets targetFlags, base reposcan.Config, selection reposcan.ScannerSelection, output reportOutput) (handled bool, err error) {
 	resolution, err := targetresolve.Resolve(repoPath)
 	if err != nil {
 		return true, fmt.Errorf("error resolving MCP targets: %w", err)
@@ -500,11 +501,11 @@ type planScanResult struct {
 }
 
 // add records one scan's executions and its findings, attributed by plan,
-// that keep accepts (all of them when keep is nil).
+// that keep accepts.
 func (r *planScanResult) add(plan *targetresolve.ScanPlan, scanUnitID string, detailed reposcan.DetailedScanResult, keep func(aggregation.AttributedFinding) bool) {
 	r.executions = append(r.executions, detailed.Executions...)
 	for _, executed := range detailed.Findings {
-		if af := attribute(plan, executed.Finding, scanUnitID, executed.ExecutionID); keep == nil || keep(af) {
+		if af := attribute(plan, executed.Finding, scanUnitID, executed.ExecutionID); keep(af) {
 			r.attributed = append(r.attributed, af)
 		}
 	}
@@ -520,23 +521,17 @@ const workspaceRootFallbackUnitID = "workspace-root-fallback"
 // the whole scan: a partial report would understate the findings.
 func scanPlan(ctx context.Context, plan *targetresolve.ScanPlan, base reposcan.Config, selection reposcan.ScannerSelection) (*planScanResult, error) {
 	result := &planScanResult{}
-	needsRootLockfiles := false
 	for _, unit := range plan.Units {
 		cfg := base
 		cfg.Root, cfg.ExcludedDirs = unit.Root, unit.ExcludedDirs
-		unitSelection := selection
-		unitSelection.SCA = selection.SCA && unit.ScansDependencies(plan.RepoRoot)
-		needsRootLockfiles = needsRootLockfiles || (unitSelection.SCA && len(unit.FallbackLockfiles) > 0)
-
 		inputSummary := fmt.Sprintf("root=%s manifests=%d lockfiles=%d files=%d", unit.RelativeRoot, len(unit.Manifests), len(unit.Lockfiles), len(unit.Files))
-		result.add(plan, unit.ID, reposcan.ScanDetailed(ctx, unit.Root, &cfg, unitSelection, unit.ID, inputSummary), nil)
+		result.add(plan, unit.ID, reposcan.ScanDetailed(ctx, unit.Root, &cfg, selection, unit.ID, inputSummary), func(af aggregation.AttributedFinding) bool {
+			return plan.Reports(af.TargetIDs)
+		})
 	}
-	if needsRootLockfiles {
-		// Only the fallback lockfiles have owning targets; every other file
-		// in the repository root was already covered (or not selected) by
-		// the plan.
+	if selection.SCA && plan.NeedsRootLockfileCheck() {
 		detailed := reposcan.ScanRootOwnFilesDetailed(plan.RepoRoot, workspaceRootFallbackUnitID, "root=. own files only")
-		result.add(plan, workspaceRootFallbackUnitID, detailed, func(af aggregation.AttributedFinding) bool { return len(af.TargetIDs) > 0 })
+		result.add(plan, workspaceRootFallbackUnitID, detailed, ownedByATarget)
 	}
 
 	var failures []string
@@ -550,6 +545,11 @@ func scanPlan(ctx context.Context, plan *targetresolve.ScanPlan, base reposcan.C
 	}
 	return result, nil
 }
+
+// ownedByATarget keeps the root lockfile check's findings in the fallback
+// lockfiles: every other file in the repository root was already covered,
+// or deliberately left out, by the plan's own units.
+func ownedByATarget(af aggregation.AttributedFinding) bool { return len(af.TargetIDs) > 0 }
 
 // attribute credits a raw finding to the targets and components that own
 // its file.

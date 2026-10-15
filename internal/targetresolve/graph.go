@@ -131,9 +131,9 @@ func includeTestDependents(primary *Project, alreadyIncluded map[*Project]bool, 
 // server.
 //
 // Two kinds of server are never demoted: one confirmed by its own
-// server.json (RoleConfirmedByManifest), and one with its own entrypoint
-// evidence (hasOwnEntrypointEvidence), which is a standalone server even
-// when another server also depends on it -- @twilio-alpha/mcp depends on
+// server.json (RoleConfirmedByManifest), and a launchable program
+// (isLaunchable), which is a standalone server even when another server
+// also depends on it -- @twilio-alpha/mcp depends on
 // @twilio-alpha/openapi-mcp-server, which has a bin entry of its own.
 func demoteReachableFallbackServers(projects []*Project, byDir map[string]*Project) {
 	reachableFromAnotherServer := make(map[*Project]bool)
@@ -152,8 +152,8 @@ func demoteReachableFallbackServers(projects []*Project, byDir map[string]*Proje
 	for _, p := range projects {
 		if p.Role == RoleMCPServer &&
 			!p.RoleConfirmedByManifest &&
-			!hasOwnEntrypointEvidence(p, projects) &&
-			reachableFromAnotherServer[p] {
+			reachableFromAnotherServer[p] &&
+			!isLaunchable(p, projects) {
 			p.Role = RoleSharedLibrary
 		}
 	}

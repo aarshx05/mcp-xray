@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -62,7 +61,7 @@ func assignIdentities(repoRoot string, projects []*Project) []*Component {
 		}
 		p.ID = stableID("project", repoRelative(repoRoot, identityPath)+"\x00"+p.Ecosystem)
 		if p.OwnershipRoot == "" {
-			p.OwnershipRoot, p.OwnershipEvidence, p.OwnershipAmbiguous = inferOwnershipRoot(repoRoot, p)
+			p.OwnershipRoot, p.OwnershipEvidence, p.OwnershipAmbiguous = inferOwnershipRoot(repoRoot, p, projects)
 		}
 		p.ComponentID = stableID("component", repoRelative(repoRoot, p.OwnershipRoot))
 	}
@@ -116,13 +115,15 @@ func assignIdentities(repoRoot string, projects []*Project) []*Component {
 	return components
 }
 
-// inferOwnershipRoot is intentionally conservative. A higher boundary is
-// selected only when a machine-readable component/registry boundary is
-// present; otherwise the manifest directory remains the ownership root.
-func inferOwnershipRoot(repoRoot string, p *Project) (string, []string, bool) {
+// inferOwnershipRoot is intentionally conservative: the ownership root is
+// the nearest directory, the project's own included, whose server.json makes
+// it a boundary (isOwnershipBoundary), and otherwise the manifest directory.
+// A project whose own directory holds its server.json owns that directory,
+// even inside an outer boundary.
+func inferOwnershipRoot(repoRoot string, p *Project, projects []*Project) (string, []string, bool) {
 	start := filepath.Clean(p.Dir)
 	for dir := start; ; dir = filepath.Dir(dir) {
-		if dir != start && hasOwnershipBoundary(dir) {
+		if isOwnershipBoundary(dir, projects) {
 			return dir, []string{fmt.Sprintf("ownership boundary discovered at %s", repoRelative(repoRoot, dir))}, false
 		}
 		if dir == filepath.Clean(repoRoot) || dir == filepath.Dir(dir) {
@@ -130,27 +131,6 @@ func inferOwnershipRoot(repoRoot string, p *Project) (string, []string, bool) {
 		}
 	}
 	return start, []string{"conservative manifest/project directory boundary"}, false
-}
-
-// hasOwnershipBoundary reports whether dir contains a genuine MCP registry
-// manifest. A directory merely containing a file NAMED server.json is not
-// enough -- registry discovery (registry_manifest.go) already rejects
-// malformed or unrelated server.json files via isValidRegistryManifest, and
-// this boundary check must apply the exact same validation. Without it, any
-// unrelated server.json sitting in a common ancestor directory would give
-// every nested project underneath it the same ComponentID, and
-// mergeTargetsByComponent (graph.go) would silently collapse independent
-// servers into a single target.
-func hasOwnershipBoundary(dir string) bool {
-	data, err := os.ReadFile(filepath.Join(dir, "server.json"))
-	if err != nil {
-		return false
-	}
-	var doc map[string]interface{}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return false
-	}
-	return isValidRegistryManifest(doc)
 }
 
 func uniqueSorted(values []string) []string {

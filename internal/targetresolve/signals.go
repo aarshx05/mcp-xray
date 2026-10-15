@@ -9,9 +9,15 @@ import (
 	"strings"
 )
 
+// nodeSDKPackages are the official TypeScript SDK's packages: the original
+// single package, and the separate server and client packages of SDK v2.
+// nodeSDKDependency names the first one a project depends on, so a project
+// that depends on the client package is client-only (clientOnlySDKs) only
+// when it depends on neither of the others.
+var nodeSDKPackages = []string{"@modelcontextprotocol/sdk", "@modelcontextprotocol/server", "@modelcontextprotocol/client"}
+
 const (
 	goSDKModulePath        = "github.com/modelcontextprotocol/go-sdk"
-	nodeSDKPackage         = "@modelcontextprotocol/sdk"
 	dotnetSDKPackagePrefix = "ModelContextProtocol"
 	javaSDKGroupID         = "io.modelcontextprotocol.sdk"
 	rustSDKCrateName       = "rmcp"
@@ -33,11 +39,13 @@ var (
 	goClientPattern = regexp.MustCompile(`mcp\.NewClient\(`)
 
 	// Node: a construction call, or any quoted import/require specifier
-	// naming the SDK's server (resp. client) sub-path however the imported
+	// naming the SDK's server (resp. client) module however the imported
 	// symbol is then used -- `class RushMCPServer extends McpServer` never
-	// calls `new McpServer(...)`.
-	nodeServerPattern = regexp.MustCompile(`new\s+(McpServer|Server)\s*\(|["']@modelcontextprotocol/sdk/server(?:/[^"']*)?["']`)
-	nodeClientPattern = regexp.MustCompile(`new\s+Client\s*\(|["']@modelcontextprotocol/sdk/client(?:/[^"']*)?["']`)
+	// calls `new McpServer(...)`. The module is @modelcontextprotocol/sdk's
+	// server sub-path or SDK v2's @modelcontextprotocol/server package (never
+	// a reference server such as @modelcontextprotocol/server-everything).
+	nodeServerPattern = regexp.MustCompile(`new\s+(McpServer|Server)\s*\(|["']@modelcontextprotocol/(?:sdk/)?server(?:/[^"']*)?["']`)
+	nodeClientPattern = regexp.MustCompile(`new\s+Client\s*\(|["']@modelcontextprotocol/(?:sdk/)?client(?:/[^"']*)?["']`)
 
 	// Python: the sub-signals are also used on their own by
 	// classifyPythonScriptProject for manifest-less scripts.
@@ -120,7 +128,7 @@ var ecosystemSourceExtensions = map[string][]string{
 // single startup call to look for.
 var wrapperEntrypointPatterns = map[string]*regexp.Regexp{
 	"go":     regexp.MustCompile(`\.Run\s*\(`),
-	"node":   regexp.MustCompile(`\.connect\s*\(|\.listen\s*\(`),
+	"node":   regexp.MustCompile(`\.connect\s*\(|\.listen\s*\(|\bserveStdio\s*\(|\bserve\s*\(\s*\{`),
 	"python": regexp.MustCompile(`\.run\s*\(|\.serve\s*\(`),
 	"dotnet": regexp.MustCompile(`\.Run\s*\(\)|\.RunAsync\s*\(`),
 	"java":   regexp.MustCompile(`\bpublic\s+static\s+void\s+main\s*\(`),
@@ -166,12 +174,15 @@ func classifyByEcosystem(p *Project, allProjects []*Project) (Role, []string) {
 	if !hasSDK {
 		return consumerOrUnrelated(p)
 	}
-	signals := projectSourceSignals(p, allProjects, ecosystemSourceExtensions[p.Ecosystem], map[string]*regexp.Regexp{
-		"server": profile.server,
-		"client": profile.client,
-	})
-	return roleFromSignals(sdk, signals)
+	patterns := map[string]*regexp.Regexp{"server": profile.server, "client": profile.client}
+	if clientOnlySDKs[sdk] {
+		delete(patterns, "server") // nothing to build a server with
+	}
+	return roleFromSignals(sdk, projectSourceSignals(p, allProjects, ecosystemSourceExtensions[p.Ecosystem], patterns))
 }
+
+// clientOnlySDKs are SDK packages that can only build clients.
+var clientOnlySDKs = map[string]bool{"@modelcontextprotocol/client": true}
 
 // sdkProfile is how one ecosystem's MCP SDK shows up: the dependency a
 // project's manifest declares, and the source patterns of server and client
@@ -261,8 +272,18 @@ func nodeSDKDependency(p *Project) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	_, ok := pkg.allDependencies()[nodeSDKPackage]
-	return nodeSDKPackage, ok, nil
+	dependencies := pkg.allDependencies()
+	for _, sdk := range nodeSDKPackages {
+		if pkg.Name == sdk {
+			return "", false, nil // the SDK itself, not a user of it
+		}
+	}
+	for _, sdk := range nodeSDKPackages {
+		if _, ok := dependencies[sdk]; ok {
+			return sdk, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 func pythonProjectSDKDependency(p *Project) (string, bool, error) {

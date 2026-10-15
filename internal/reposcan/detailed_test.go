@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"mcpxray/proto"
 )
 
 func TestExecutionIDDeterministic(t *testing.T) {
@@ -79,5 +81,22 @@ func TestScanRootOwnFilesDetailed_RecordsOneOSVExecution(t *testing.T) {
 	}
 	if len(result.Findings) != 0 {
 		t.Errorf("findings = %d, want none for an empty directory", len(result.Findings))
+	}
+}
+
+// The taint engines report a file relative to the directory they scanned;
+// every recorded finding is located absolutely, whichever scanner found it.
+func TestRun_MakesScanRootRelativeFilesAbsolute(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "unit")
+	elsewhere := filepath.Join(t.TempDir(), "b.py")
+	var result DetailedScanResult
+	result.run(root, "unit-1", "sast", "", true, func() ([]*proto.Finding, error) {
+		return []*proto.Finding{{File: filepath.Join("src", "a.py")}, {File: elsewhere}, {}}, nil
+	})
+	want := []string{filepath.Join(root, "src", "a.py"), elsewhere, ""}
+	for i, finding := range result.Findings {
+		if finding.Finding.File != want[i] {
+			t.Errorf("finding %d file = %q, want %q", i, finding.Finding.File, want[i])
+		}
 	}
 }

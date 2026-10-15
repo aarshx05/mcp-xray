@@ -15,8 +15,8 @@ import (
 // in discoverProjects below (see newDotnetProject) because its filename
 // varies per project (e.g. Fabric.Mcp.Server.csproj), so it can't be a map
 // key. newRustProject can return (nil, nil) for a Cargo.toml that declares
-// no [package] (a virtual workspace-root manifest) -- already tolerated by
-// the `if project != nil` check below, same as any other constructor.
+// no [package] (a virtual workspace-root manifest); discoverProjects skips
+// a nil project like a malformed manifest.
 var manifestConstructors = map[string]func(manifestPath string) (*Project, error){
 	"go.mod":         newGoProject,
 	"package.json":   newNodeProject,

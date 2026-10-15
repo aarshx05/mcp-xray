@@ -67,7 +67,10 @@ func residualExcludes(repoRoot string, roots []string) []string {
 // unitRoot but is not in includedRoots. Without this, a scanner recursing
 // over unitRoot also walks into and reports findings for any other project
 // that merely happens to live in a subdirectory -- e.g. an unrelated tool
-// nested inside a selected target's own directory tree.
+// nested inside a selected target's own directory tree. A project that
+// encloses an included root is kept, or the included project would be cut
+// out too; the plan leaves its files' findings out of the report
+// (ScanPlan.Reports).
 //
 // A foreign root nested inside another foreign root is collapsed to just the
 // outer one via dropNestedRoots: Config.ShouldExclude's prefix match already
@@ -78,7 +81,7 @@ func nestedForeignExcludes(unitRoot string, includedRoots map[string]bool, allPr
 	seen := make(map[string]bool)
 	for _, p := range allProjects {
 		root := p.ScanRoot()
-		if root == cleanUnitRoot || includedRoots[root] || !within(root, cleanUnitRoot) {
+		if root == cleanUnitRoot || includedRoots[root] || !within(root, cleanUnitRoot) || enclosesAny(root, includedRoots) {
 			continue
 		}
 		if !seen[root] {
@@ -94,6 +97,17 @@ func nestedForeignExcludes(unitRoot string, includedRoots map[string]bool, allPr
 	}
 	sort.Strings(rels)
 	return rels
+}
+
+// enclosesAny reports whether one of roots lies below dir: excluding dir
+// would cut that included project out of the scan too.
+func enclosesAny(dir string, roots map[string]bool) bool {
+	for root := range roots {
+		if root != dir && within(root, dir) {
+			return true
+		}
+	}
+	return false
 }
 
 // dropNestedRoots removes any path that is a subdirectory of another path

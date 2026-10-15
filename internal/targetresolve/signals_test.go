@@ -477,3 +477,40 @@ func TestPep508PackageName(t *testing.T) {
 		}
 	}
 }
+
+// SDK v2 publishes the server and client as their own packages; depending
+// on and importing @modelcontextprotocol/server is server evidence, while a
+// reference server such as @modelcontextprotocol/server-everything is not.
+func TestClassifyNodeProject_SplitSDKPackages(t *testing.T) {
+	cases := []struct {
+		name, deps, source string
+		want               Role
+	}{
+		{"v2 server", `{"@modelcontextprotocol/server": "^2.0.0"}`, `import { McpServer } from "@modelcontextprotocol/server";`, RoleMCPServer},
+		{"v2 client", `{"@modelcontextprotocol/client": "^2.0.0"}`, `import { Client } from "@modelcontextprotocol/client";`, RoleMCPClient},
+		{"reference server dependency", `{"@modelcontextprotocol/server-everything": "^1.0.0"}`, `import "@modelcontextprotocol/server-everything";`, RoleUnrelated},
+		{"client-only SDK with an unrelated Server class", `{"@modelcontextprotocol/client": "^2.0.0"}`, `const io = new Server(httpServer);`, RoleMCPClient},
+		{"client launching a reference server", `{"@modelcontextprotocol/sdk": "^1.0.0"}`, `import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"; const pkg = "@modelcontextprotocol/server-everything";`, RoleMCPClient},
+	}
+	for _, tc := range cases {
+		root := t.TempDir()
+		writeFile(t, filepath.Join(root, "package.json"), `{"name": "app", "dependencies": `+tc.deps+`}`)
+		writeFile(t, filepath.Join(root, "index.ts"), tc.source+"\n")
+		p, _ := newNodeProject(filepath.Join(root, "package.json"))
+		if role, evidence := classifyProject(p, []*Project{p}); role != tc.want {
+			t.Errorf("%s: role = %v, want %v (evidence: %v)", tc.name, role, tc.want, evidence)
+		}
+	}
+}
+
+// The SDK's own packages depend on one another; the SDK is not a user of
+// itself.
+func TestClassifyNodeProject_SDKPackageIsNotItsOwnUser(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "@modelcontextprotocol/sdk", "dependencies": {"@modelcontextprotocol/server": "workspace:*"}}`)
+	writeFile(t, filepath.Join(root, "index.ts"), `export * from "@modelcontextprotocol/server";`+"\n")
+	p, _ := newNodeProject(filepath.Join(root, "package.json"))
+	if role, evidence := classifyProject(p, []*Project{p}); role != RoleUnrelated {
+		t.Errorf("role = %v, want unrelated (evidence: %v)", role, evidence)
+	}
+}

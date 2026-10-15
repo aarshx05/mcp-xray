@@ -6,67 +6,57 @@ import (
 	"testing"
 )
 
-func TestHasOwnershipBoundary_ValidServerJSON(t *testing.T) {
+func TestIsOwnershipBoundary_ValidServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), validServerJSON)
-	if !hasOwnershipBoundary(dir) {
+	if !isOwnershipBoundary(dir, nil) {
 		t.Error("expected a valid server.json to be recognized as an ownership boundary")
 	}
 }
 
-func TestHasOwnershipBoundary_UnrelatedFileNamedServerJSON(t *testing.T) {
-	// Reproduces the reported flaw directly: hasOwnershipBoundary used to
-	// only check that a file NAMED server.json existed, never that it was
-	// actually a valid MCP registry manifest.
+func TestIsOwnershipBoundary_UnrelatedFileNamedServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"port": 8080, "host": "localhost"}`)
-	if hasOwnershipBoundary(dir) {
+	if isOwnershipBoundary(dir, nil) {
 		t.Error("expected an unrelated file merely named server.json to NOT be an ownership boundary")
 	}
 }
 
-func TestHasOwnershipBoundary_BlankNameServerJSON(t *testing.T) {
+func TestIsOwnershipBoundary_BlankNameServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "", "packages": [{"registryType": "npm", "identifier": "x"}]}`)
-	if hasOwnershipBoundary(dir) {
+	if isOwnershipBoundary(dir, nil) {
 		t.Error("expected a blank-name server.json to NOT be an ownership boundary")
 	}
 }
 
-func TestHasOwnershipBoundary_ComponentJSONAloneIsNotABoundary(t *testing.T) {
-	// component.json is the legacy Bower package manifest filename, unrelated
-	// to MCP and common enough in older JavaScript repos that treating it as
-	// an ownership boundary risked false positives. It is deliberately not
-	// checked at all any more.
+func TestIsOwnershipBoundary_ComponentJSONAloneIsNotABoundary(t *testing.T) {
+	// component.json is the Bower package manifest, unrelated to MCP.
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "component.json"), `{"name": "some-bower-package"}`)
-	if hasOwnershipBoundary(dir) {
+	if isOwnershipBoundary(dir, nil) {
 		t.Error("expected component.json alone to NOT be an ownership boundary")
 	}
 }
 
-func TestHasOwnershipBoundary_NoFile(t *testing.T) {
+func TestIsOwnershipBoundary_NoFile(t *testing.T) {
 	dir := t.TempDir()
-	if hasOwnershipBoundary(dir) {
+	if isOwnershipBoundary(dir, nil) {
 		t.Error("expected a directory with neither file to NOT be an ownership boundary")
 	}
 }
 
-func TestHasOwnershipBoundary_MalformedJSON(t *testing.T) {
+func TestIsOwnershipBoundary_MalformedJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{not valid json`)
-	if hasOwnershipBoundary(dir) {
+	if isOwnershipBoundary(dir, nil) {
 		t.Error("expected malformed JSON to NOT be an ownership boundary")
 	}
 }
 
-// TestAssignIdentities_UnrelatedServerJSONDoesNotMergeIndependentServers is
-// the end-to-end reproduction of the reported consequence: two independent
-// projects nested under a common ancestor that happens to contain an
-// unrelated file named server.json must keep separate ComponentIDs (and,
-// downstream in buildTargets/mergeTargetsByComponent, remain two separate
-// targets) rather than being silently collapsed into one because the old
-// hasOwnershipBoundary treated any server.json as authoritative.
+// Two independent projects under a common ancestor that holds an unrelated
+// file named server.json keep separate ComponentIDs (and so remain two
+// targets) rather than being collapsed into one.
 func TestAssignIdentities_UnrelatedServerJSONDoesNotMergeIndependentServers(t *testing.T) {
 	root := t.TempDir()
 	platformDir := filepath.Join(root, "platform")
@@ -97,11 +87,9 @@ func TestAssignIdentities_UnrelatedServerJSONDoesNotMergeIndependentServers(t *t
 	}
 }
 
-// TestAssignIdentities_ValidServerJSONStillMergesSiblingProjects is the
-// regression check for the case hasOwnershipBoundary is actually meant to
-// handle: a REAL registry manifest one directory above two projects that
-// belong together (e.g. a .NET server and a client packaged alongside it)
-// must still merge them into one component.
+// A real registry manifest one directory above a project makes that
+// directory the project's ownership root, so projects that belong together
+// (a .NET server and a client packaged alongside it) share one component.
 func TestAssignIdentities_ValidServerJSONStillMergesSiblingProjects(t *testing.T) {
 	root := t.TempDir()
 	componentDir := filepath.Join(root, "my-component")
@@ -155,5 +143,33 @@ func TestResolve_DependencyDiscoveredAfterItsDependentStaysInScope(t *testing.T)
 	}
 	if !included["a-lib"] || !included["z-lib"] {
 		t.Errorf("target scope = %v, want both a-lib and z-lib included", included)
+	}
+}
+
+// A manifest that only points at a hosted server describes no local code,
+// so it does not group the projects below it into one component.
+func TestIsOwnershipBoundary_RemotesOnlyManifest(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "com.example/hosted", "remotes": [{"type": "streamable-http", "url": "https://example.com/mcp"}]}`)
+	if isOwnershipBoundary(dir, nil) {
+		t.Error("a remotes-only server.json must not be an ownership boundary")
+	}
+}
+
+// A project whose own directory holds its server.json owns that directory,
+// even inside an outer boundary, so the projects below it belong to it
+// rather than the other way round.
+func TestAssignIdentities_NestedServerJSONOwnsItsOwnDirectory(t *testing.T) {
+	root := t.TempDir()
+	outer, inner, nested := filepath.Join(root, "pkg"), filepath.Join(root, "pkg", "sub"), filepath.Join(root, "pkg", "sub", "x")
+	writeFile(t, filepath.Join(outer, "server.json"), validServerJSON)
+	writeFile(t, filepath.Join(inner, "server.json"), validServerJSON)
+	server := &Project{Name: "sub", Dir: inner, Ecosystem: "node", Role: RoleMCPServer}
+	tool := &Project{Name: "x", Dir: nested, Ecosystem: "node"}
+
+	assignIdentities(root, []*Project{server, tool})
+
+	if server.OwnershipRoot != filepath.Clean(inner) || tool.OwnershipRoot != filepath.Clean(inner) {
+		t.Errorf("ownership roots = %q, %q; want both %q", server.OwnershipRoot, tool.OwnershipRoot, inner)
 	}
 }

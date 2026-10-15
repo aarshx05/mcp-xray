@@ -331,3 +331,44 @@ func targetNames(targets []*Target) []string {
 	}
 	return names
 }
+
+// A library whose source merely contains a startup call (a connect helper)
+// is still shared code when a server depends on it: only a declared
+// entrypoint makes it a standalone server.
+func TestDemoteReachableFallbackServers_StartupCallAloneDoesNotProtect(t *testing.T) {
+	root := t.TempDir()
+	coreDir := filepath.Join(root, "core")
+	writeFile(t, filepath.Join(coreDir, "index.ts"), "export async function start(server, transport) { await server.connect(transport) }\n")
+	server := &Project{Name: "server", Dir: filepath.Join(root, "server"), Ecosystem: "node", Role: RoleMCPServer, BinNames: []string{"server"}}
+	core := &Project{Name: "core", Dir: coreDir, Ecosystem: "node", Role: RoleMCPServer}
+	server.LocalDeps = []string{core.Dir}
+
+	targets := buildTargets([]*Project{server, core})
+
+	if core.Role != RoleSharedLibrary {
+		t.Errorf("core role = %v, want shared-library", core.Role)
+	}
+	if len(targets) != 1 {
+		t.Errorf("targets = %v, want only the server", targetNames(targets))
+	}
+}
+
+// A server that a package.json script starts, or (outside Node) whose own
+// source starts it, is a program of its own and keeps its target when
+// another server depends on it.
+func TestDemoteReachableFallbackServers_LaunchableServersStay(t *testing.T) {
+	root := t.TempDir()
+	scripted := &Project{Name: "oauth", Dir: filepath.Join(root, "oauth"), ManifestPath: filepath.Join(root, "oauth", "package.json"), Ecosystem: "node", Role: RoleMCPServer}
+	writeFile(t, scripted.ManifestPath, `{"name": "oauth", "scripts": {"server": "tsx server.ts", "build": "tsc"}}`)
+	writeFile(t, filepath.Join(scripted.Dir, "server.ts"), "import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";\nconst server = new McpServer({ name: \"oauth\", version: \"1\" });\napp.listen(3000)\n")
+	python := &Project{Name: "weather", Dir: filepath.Join(root, "weather"), Ecosystem: "python", Role: RoleMCPServer}
+	writeFile(t, filepath.Join(python.Dir, "server.py"), "if __name__ == '__main__':\n    mcp.run()\n")
+	gateway := &Project{Name: "gateway", Dir: filepath.Join(root, "gateway"), Ecosystem: "node", Role: RoleMCPServer, BinNames: []string{"gateway"}}
+	gateway.LocalDeps = []string{scripted.Dir, python.Dir}
+
+	targets := buildTargets([]*Project{gateway, scripted, python})
+
+	if scripted.Role != RoleMCPServer || python.Role != RoleMCPServer || len(targets) != 3 {
+		t.Errorf("roles = %v, %v; targets = %v; want all three servers kept", scripted.Role, python.Role, targetNames(targets))
+	}
+}

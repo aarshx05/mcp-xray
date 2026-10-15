@@ -65,6 +65,11 @@ type Project struct {
 	// name where available, falling back to the directory's base name.
 	Name string
 
+	// PackageName is the name the project's own manifest publishes it under
+	// (package.json "name", pyproject.toml's project name); empty when it
+	// declares none. Unlike Name, it never changes after discovery.
+	PackageName string
+
 	// Dir is the absolute path to the project root (the directory containing
 	// ManifestPath).
 	Dir string
@@ -118,6 +123,11 @@ type Project struct {
 	// existing SCA scanner and are out of scope for this package.
 	LocalDeps []string
 
+	// DevLocalDeps is the subset of LocalDeps the project needs only for
+	// development (Python dependency groups and Poetry groups), never when
+	// it runs.
+	DevLocalDeps []string
+
 	// LocalDepIDs is the stable-ID form of LocalDeps. LocalDeps remains for
 	// compatibility with existing ecosystem adapters and callers; graph
 	// planning uses this field when it is populated.
@@ -145,10 +155,9 @@ type Project struct {
 	// for every non-Node project and for a Node project with no "bin"
 	// field. This is auxiliary identity/executability evidence only -- no
 	// require-following or build-output resolution is performed. It is
-	// consulted by wrapper_classify.go's hasOwnEntrypointEvidence (a
-	// project with its own bin entry has independent proof of being a
-	// launchable entrypoint, not just a downstream dependency) and surfaced
-	// by cmd/xray/target_cli.go for display.
+	// consulted by wrapper_classify.go's hasDeclaredEntrypoint (a project
+	// with its own bin entry is a launchable program, not just a downstream
+	// dependency) and surfaced by cmd/xray/target_cli.go for display.
 	BinNames []string
 }
 
@@ -182,8 +191,9 @@ const (
 	InclusionTestDependent InclusionReason = "test-dependent"
 )
 
-// rank orders inclusion reasons so that, when two targets merge, a project
-// keeps the strongest reason it was included for.
+// rank orders inclusion reasons so that a project included for several
+// reasons (when two targets merge, or when a component's relation is
+// decided) keeps the strongest one.
 func (r InclusionReason) rank() int {
 	switch r {
 	case InclusionPrimary:

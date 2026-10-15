@@ -139,12 +139,11 @@ func TestBuildScanPlan_DoesNotExcludeLegitimateNestedSharedComponent(t *testing.
 	}
 }
 
-// TestBuildScanPlan_NestedForeignExcludeDoesNotAffectRepoGlobalUnit confirms
-// the repository-global unit keeps its own, deliberately different exclusion
-// rule (residualExcludes: only the scheduled roots) rather than
-// also applying nestedForeignExcludes -- a repo-global scan is documented to
-// intentionally still cover other discovered-but-unselected projects.
-func TestBuildScanPlan_NestedForeignExcludeDoesNotAffectRepoGlobalUnit(t *testing.T) {
+// With repository-global content included, an unselected project nested in
+// a target's unit is still scanned exactly once: the global unit excludes
+// the whole scheduled root, so the target's unit keeps the nested project,
+// whose files belong to no target.
+func TestBuildScanPlan_RepoGlobalScansNestedUnselectedProjectOnce(t *testing.T) {
 	root := t.TempDir()
 	appDir := filepath.Join(root, "app")
 	foreignDir := filepath.Join(root, "app", "tools", "other")
@@ -177,6 +176,121 @@ func TestBuildScanPlan_NestedForeignExcludeDoesNotAffectRepoGlobalUnit(t *testin
 		if len(unit.ExcludedDirs) != 1 || unit.ExcludedDirs[0] != "app" {
 			t.Errorf("expected the global unit to exclude only [\"app\"], got %v", unit.ExcludedDirs)
 		}
+	}
+	foreignFile := filepath.Join(foreignDir, "main.go")
+	covering := 0
+	for _, unit := range plan.Units {
+		if within(foreignFile, unit.Root) && !isExcludedFromUnit(unit, foreignFile) {
+			covering++
+		}
+	}
+	if covering != 1 {
+		t.Errorf("app/tools/other is scanned by %d units, want exactly 1", covering)
+	}
+	resolution.Components = []*Component{{ID: "c-app", Root: appDir}, {ID: "c-foreign", Root: foreignDir}}
+	plan, err = BuildScanPlan(resolution, PlanOptions{TargetIDs: []string{"t-app"}, IncludeRepoGlobal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fo := plan.OwnershipOf(foreignFile); len(fo.TargetIDs) != 0 || fo.Relation != RelationRepositoryGlobal {
+		t.Errorf("OwnershipOf(app/tools/other/main.go) = %+v, want repository-global, owned by no target", fo)
+	}
+}
+
+// A file belongs to the project nearest to it: a target whose shared
+// library is the repository root does not own another target's files below
+// it (two Go examples that replace the SDK module at the root).
+func TestOwnershipOf_InnermostProjectOwnsTheFile(t *testing.T) {
+	root := t.TempDir()
+	aDir, bDir := filepath.Join(root, "examples", "a"), filepath.Join(root, "examples", "b")
+	sdk := &Project{ID: "p-sdk", Dir: root, OwnershipRoot: root, ComponentID: "c-sdk"}
+	a := &Project{ID: "p-a", Dir: aDir, OwnershipRoot: aDir, ComponentID: "c-a"}
+	b := &Project{ID: "p-b", Dir: bDir, OwnershipRoot: bDir, ComponentID: "c-b"}
+	ta := &Target{ID: "t-a", Project: a, Included: []*Project{a, sdk}, IncludedReasons: map[string]InclusionReason{aDir: InclusionPrimary, root: InclusionSharedDependency}}
+	tb := &Target{ID: "t-b", Project: b, Included: []*Project{b, sdk}, IncludedReasons: map[string]InclusionReason{bDir: InclusionPrimary, root: InclusionSharedDependency}}
+	resolution := &Resolution{
+		RepoRoot:   root,
+		Projects:   []*Project{sdk, a, b},
+		Targets:    []*Target{ta, tb},
+		Components: []*Component{{ID: "c-sdk", Root: root}, {ID: "c-a", Root: aDir}, {ID: "c-b", Root: bDir}},
+		Inventory: []InventoryEntry{
+			{Path: "examples/a/main.go", ComponentIDs: []string{"c-a", "c-sdk"}},
+			{Path: "mcp/server.go", ComponentIDs: []string{"c-sdk"}},
+		},
+	}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fo := plan.OwnershipOf("examples/a/main.go"); strings.Join(fo.TargetIDs, ",") != "t-a" || fo.Relation != RelationDirect {
+		t.Errorf("examples/a/main.go = %+v, want only t-a, direct", fo)
+	}
+	if fo := plan.OwnershipOf("mcp/server.go"); strings.Join(fo.TargetIDs, ",") != "t-a,t-b" || fo.Relation != RelationShared {
+		t.Errorf("mcp/server.go = %+v, want both targets, shared", fo)
+	}
+}
+
+// An unselected project that encloses a selected one is never excluded:
+// that would cut the target's own code out of the scan. Its other nested
+// projects still are, and its own files are left out of the report.
+func TestBuildScanPlan_NeverExcludesAProjectEnclosingTheTarget(t *testing.T) {
+	root := t.TempDir()
+	examples := filepath.Join(root, "examples")
+	aDir, bDir := filepath.Join(examples, "server", "a"), filepath.Join(examples, "server", "b")
+	lib := &Project{ID: "p-lib", Dir: root, OwnershipRoot: root, ComponentID: "c-lib"}
+	unrelated := &Project{ID: "p-examples", Dir: examples, OwnershipRoot: examples, ComponentID: "c-examples"}
+	a := &Project{ID: "p-a", Dir: aDir, OwnershipRoot: aDir, ComponentID: "c-a"}
+	b := &Project{ID: "p-b", Dir: bDir, OwnershipRoot: bDir, ComponentID: "c-b"}
+	target := &Target{ID: "t-a", Project: a, Included: []*Project{a, lib}, IncludedReasons: map[string]InclusionReason{aDir: InclusionPrimary, root: InclusionSharedDependency}}
+	resolution := &Resolution{
+		RepoRoot:   root,
+		Projects:   []*Project{lib, unrelated, a, b},
+		Targets:    []*Target{target},
+		Components: []*Component{{ID: "c-lib", Root: root}, {ID: "c-examples", Root: examples}, {ID: "c-a", Root: aDir}, {ID: "c-b", Root: bDir}},
+	}
+
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Units) != 1 || strings.Join(plan.Units[0].ExcludedDirs, ",") != "examples/server/b" {
+		t.Fatalf("units = %+v, want one root unit excluding only examples/server/b", plan.Units)
+	}
+	if fo := plan.OwnershipOf("examples/tool.go"); len(fo.TargetIDs) != 0 || plan.Reports(fo.TargetIDs) {
+		t.Errorf("examples/tool.go = %+v; the enclosing project's own file belongs to no target and is not reported", fo)
+	}
+	if fo := plan.OwnershipOf("examples/server/a/main.go"); !plan.Reports(fo.TargetIDs) {
+		t.Errorf("examples/server/a/main.go = %+v; the target's own file must be reported", fo)
+	}
+}
+
+// A target whose project is the repository root scans only what it
+// includes: other discovered projects below the root are not its files.
+func TestBuildScanPlan_RootTargetExcludesNestedForeignProjects(t *testing.T) {
+	root := t.TempDir()
+	foreignDir := filepath.Join(root, "servers", "other")
+	if err := os.MkdirAll(foreignDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootProject := &Project{ID: "p-root", Name: "root", Dir: root, OwnershipRoot: root, ComponentID: "c-root"}
+	foreignProject := &Project{ID: "p-other", Name: "other", Dir: foreignDir, OwnershipRoot: foreignDir, ComponentID: "c-other", Role: RoleMCPServer}
+	target := &Target{ID: "t-root", Name: "root", Project: rootProject, Included: []*Project{rootProject}, IncludedReasons: map[string]InclusionReason{root: InclusionPrimary}}
+	resolution := &Resolution{RepoRoot: root, Projects: []*Project{rootProject, foreignProject}, Targets: []*Target{target}}
+
+	plan, err := BuildScanPlan(resolution, PlanOptions{TargetIDs: []string{"t-root"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Units) != 1 || strings.Join(plan.Units[0].ExcludedDirs, ",") != "servers/other" {
+		t.Fatalf("units = %+v, want one root unit excluding servers/other", plan.Units)
+	}
+
+	plan, err = BuildScanPlan(resolution, PlanOptions{TargetIDs: []string{"t-root"}, IncludeRepoGlobal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Units) != 1 || len(plan.Units[0].ExcludedDirs) != 0 {
+		t.Errorf("with repository-global content the root unit must cover servers/other, got exclusions %v", plan.Units[0].ExcludedDirs)
 	}
 }
 
@@ -604,9 +718,7 @@ func TestBuildScanPlan_FoldedNestedTargetKeepsUnitAndFallback(t *testing.T) {
 }
 
 // A target reaching one unit both as its own project and through a folded
-// nested dependency keeps its strongest relation, direct: a repository-root
-// target whose shared library lives below it must still have the root unit
-// scan its dependencies.
+// nested dependency keeps its strongest relation, direct.
 func TestBuildScanPlan_FoldedDependencyKeepsDirectRelation(t *testing.T) {
 	root := t.TempDir()
 	libDir := filepath.Join(root, "lib")
@@ -627,9 +739,6 @@ func TestBuildScanPlan_FoldedDependencyKeepsDirectRelation(t *testing.T) {
 	}
 	if got := plan.Units[0].Relations["t"]; got != RelationDirect {
 		t.Errorf("root unit relation = %q, want %q", got, RelationDirect)
-	}
-	if !plan.Units[0].ScansDependencies(root) {
-		t.Error("the root unit of a repository-root target must scan dependencies")
 	}
 }
 
@@ -831,8 +940,7 @@ func TestBuildFileOwnershipWithMultipleTargets(t *testing.T) {
 			},
 		},
 	}
-	relations := map[string]Relation{"c-a": RelationDirect, "c-b": RelationDirect, "c-shared": RelationShared}
-	ownership := buildFileOwnership(resolution, relations, targets)
+	ownership := buildFileOwnership(resolution, newOwnershipModel(resolution, targets))
 
 	if fo := ownership["shared/util.go"]; fo == nil {
 		t.Fatal("shared/util.go missing from ownership")
@@ -951,23 +1059,142 @@ func fallbackNames(unit *ScanUnit) string {
 	return strings.Join(names, ",")
 }
 
-// A unit below the repository root always scans dependencies; the unit at
-// the root only does when a selected target's own project lives there, since
-// otherwise the root's dependency files belong to no selected target.
-func TestScanUnit_ScansDependencies(t *testing.T) {
+// Units that rely on root lockfiles need them scanned on their behalf,
+// unless a unit rooted at the repository root scans them anyway.
+func TestScanPlan_NeedsRootLockfileCheck(t *testing.T) {
 	repoRoot := t.TempDir()
+	member := &ScanUnit{Root: filepath.Join(repoRoot, "packages", "a"), FallbackLockfiles: map[string][]string{"package-lock.json": {"t"}}}
+	pinned := &ScanUnit{Root: filepath.Join(repoRoot, "packages", "b")}
+	global := &ScanUnit{Root: repoRoot}
 	cases := []struct {
-		name string
-		unit ScanUnit
-		want bool
+		name  string
+		units []*ScanUnit
+		want  bool
 	}{
-		{"nested unit", ScanUnit{Root: filepath.Join(repoRoot, "server"), Relations: map[string]Relation{"t": RelationShared}}, true},
-		{"root unit of a root-level target", ScanUnit{Root: repoRoot, Relations: map[string]Relation{"t": RelationDirect}}, true},
-		{"repository-global root unit", ScanUnit{Root: repoRoot, Relations: map[string]Relation{"t": RelationRepositoryGlobal}}, false},
+		{"a unit relies on a root lockfile", []*ScanUnit{pinned, member}, true},
+		{"no unit relies on one", []*ScanUnit{pinned}, false},
+		{"the repository-global unit scans the root", []*ScanUnit{member, global}, false},
 	}
 	for _, tc := range cases {
-		if got := tc.unit.ScansDependencies(repoRoot); got != tc.want {
-			t.Errorf("%s: ScansDependencies() = %v, want %v", tc.name, got, tc.want)
+		plan := &ScanPlan{RepoRoot: repoRoot, Units: tc.units}
+		if got := plan.NeedsRootLockfileCheck(); got != tc.want {
+			t.Errorf("%s: NeedsRootLockfileCheck() = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// A finding in a directory the inventory skips by default (bin/, reported
+// because the run turned the default exclusions off) still belongs to the
+// target whose component contains it.
+func TestOwnershipOf_FileOutsideInventoryBelongsToItsComponent(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "packages", "app")
+	app := &Project{ID: "p-app", Name: "app", Dir: appDir, OwnershipRoot: appDir, ComponentID: "c-app"}
+	target := &Target{ID: "t-app", Name: "app", Project: app, Included: []*Project{app}, IncludedReasons: map[string]InclusionReason{appDir: InclusionPrimary}, ComponentID: "c-app"}
+	resolution := &Resolution{
+		RepoRoot:   root,
+		Projects:   []*Project{app},
+		Targets:    []*Target{target},
+		Components: []*Component{{ID: "c-app", Root: appDir, ProjectIDs: []string{"p-app"}}},
+		Inventory:  []InventoryEntry{{Path: "packages/app/index.js", ProjectIDs: []string{"p-app"}, ComponentIDs: []string{"c-app"}}},
+	}
+	plan, err := BuildScanPlan(resolution, PlanOptions{AllTargets: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fo := plan.OwnershipOf(filepath.Join(appDir, "bin", "cli.js"))
+	if strings.Join(fo.TargetIDs, ",") != "t-app" || fo.Relation != RelationDirect || strings.Join(fo.ComponentIDs, ",") != "c-app" {
+		t.Errorf("OwnershipOf(packages/app/bin/cli.js) = %+v, want t-app's direct file", fo)
+	}
+	if fo := plan.OwnershipOf("tools/script.sh"); len(fo.TargetIDs) != 0 || fo.Relation != RelationRepositoryGlobal {
+		t.Errorf("OwnershipOf(tools/script.sh) = %+v, want repository-global", fo)
+	}
+}
+
+// The inventory lists what the scanners see by default, flags dependency
+// files, records each file's owners, and sets MCP X-Ray's own reports aside.
+func TestBuildInventory(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "app")
+	for path, content := range map[string]string{
+		"app/package.json":                `{"name": "app"}`,
+		"app/package-lock.json":           `{}`,
+		"app/src/index.js":                "",
+		"app/node_modules/dep/index.js":   "",
+		"app/bin/cli.js":                  "",
+		"app/plugin/package.json":         `{"name": "plugin"}`,
+		"README.md":                       "",
+		"findings-repo-scan-1.sarif.json": "{}",
+		"reports/mcpxray-run.sarif.json":  "{}",
+	} {
+		writeFile(t, filepath.Join(root, filepath.FromSlash(path)), content)
+	}
+	app := &Project{ID: "p-app", Dir: appDir, OwnershipRoot: appDir, ComponentID: "c-app"}
+	plugin := &Project{ID: "p-plugin", Dir: filepath.Join(appDir, "plugin"), OwnershipRoot: filepath.Join(appDir, "plugin"), ComponentID: "c-plugin"}
+
+	inventory, excluded, err := buildInventory(root, []*Project{app, plugin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]InventoryEntry{}
+	for _, entry := range inventory {
+		got[entry.Path] = entry
+	}
+	var paths []string
+	for _, entry := range inventory {
+		paths = append(paths, entry.Path)
+	}
+	if strings.Join(paths, ",") != "README.md,app/package-lock.json,app/package.json,app/plugin/package.json,app/src/index.js" {
+		t.Errorf("inventory = %v, want the five files outside node_modules/ and bin/", paths)
+	}
+	if e := got["app/plugin/package.json"]; e.Ownership != "app/plugin" || len(e.ProjectIDs) != 2 {
+		t.Errorf("app/plugin/package.json = %+v, want both projects listed and the innermost, app/plugin, as owner", e)
+	}
+	if e := got["app/package.json"]; !e.Manifest || e.Ownership != "app" || strings.Join(e.ComponentIDs, ",") != "c-app" {
+		t.Errorf("app/package.json = %+v, want a manifest owned by app", e)
+	}
+	if e := got["app/package-lock.json"]; !e.Lockfile {
+		t.Errorf("app/package-lock.json = %+v, want a lockfile", e)
+	}
+	if e := got["README.md"]; e.Ownership != "unowned" || len(e.ProjectIDs) != 0 {
+		t.Errorf("README.md = %+v, want unowned", e)
+	}
+	if strings.Join(excluded, ",") != "findings-repo-scan-1.sarif.json,reports/mcpxray-run.sarif.json" {
+		t.Errorf("excluded = %v, want the two generated reports", excluded)
+	}
+}
+
+// A target reaching one unit several ways keeps its strongest relation to
+// it, whatever the order: its own project, then a dependency, then a test
+// project.
+func TestScanUnit_AddTargetKeepsStrongestRelation(t *testing.T) {
+	for _, order := range [][]Relation{
+		{RelationCompanion, RelationShared},
+		{RelationShared, RelationCompanion},
+		{RelationRepositoryGlobal, RelationCompanion, RelationShared},
+	} {
+		unit := &ScanUnit{Relations: map[string]Relation{}}
+		for _, relation := range order {
+			unit.addTarget("t", relation)
+		}
+		if unit.Relations["t"] != RelationShared {
+			t.Errorf("%v: relation = %q, want shared", order, unit.Relations["t"])
+		}
+		unit.addTarget("t", RelationDirect)
+		unit.addTarget("t", RelationCompanion)
+		if unit.Relations["t"] != RelationDirect || len(unit.TargetIDs) != 1 {
+			t.Errorf("%v: relation = %q, targets = %v; want direct, one target", order, unit.Relations["t"], unit.TargetIDs)
+		}
+	}
+}
+
+func TestScanPlan_Reports(t *testing.T) {
+	plan := &ScanPlan{}
+	if plan.Reports(nil) || !plan.Reports([]string{"t"}) {
+		t.Error("a target plan reports exactly the findings a selected target owns")
+	}
+	plan.IncludesRepoGlobal = true
+	if !plan.Reports(nil) {
+		t.Error("a plan with repository-global content reports unowned findings too")
 	}
 }

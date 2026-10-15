@@ -252,3 +252,13 @@ func TestResolveNodeLocalDeps_WorkspaceProtocolSpecs(t *testing.T) {
 		})
 	}
 }
+
+// npm allows non-string "scripts" values such as its "//" comments; they
+// must not make a package unreadable and drop it from discovery.
+func TestNewNodeProject_NonStringScriptValues(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "package.json"), `{"name": "server", "scripts": {"//": ["start with npm start"], "start": "node index.js"}}`)
+	if p, err := newNodeProject(filepath.Join(dir, "package.json")); err != nil || p.Name != "server" {
+		t.Errorf("newNodeProject = %+v, %v; want the server project", p, err)
+	}
+}

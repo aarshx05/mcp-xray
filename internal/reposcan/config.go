@@ -33,8 +33,10 @@ type Config struct {
 	CodeQLTimeoutSec int
 }
 
-// defaultExcludedDirs are dependency caches, build outputs and VCS/IDE
-// metadata: directories that never hold a repository's own source.
+// defaultExcludedDirs are the directories scanning skips by default:
+// dependency caches, build outputs and VCS/IDE metadata. Some names (bin,
+// build) can also hold a project's own files; --use-default-excludes=false
+// scans them.
 var defaultExcludedDirs = []string{
 	".venv",
 	"venv",

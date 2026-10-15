@@ -168,6 +168,7 @@ func (s *SASTScanner) runTaintEngine(ctx context.Context) []*proto.Finding {
 		if p, err := eng.Scan(ctx, s.repoPath); err != nil {
 			fmt.Printf("SAST opengrep error (skipping): %v\n", err)
 		} else {
+			p = s.dropExcludedPaths(p) // --exclude carries ExcludedPaths patterns, not ExcludedDirs
 			fmt.Printf("SAST opengrep found %d taint paths\n", len(p))
 			paths = append(paths, p...)
 		}
@@ -210,8 +211,9 @@ func (s *SASTScanner) runTaintEngine(ctx context.Context) []*proto.Finding {
 }
 
 // dropExcludedPaths removes taint paths whose sink or source file is under a configured
-// excluded path, so CodeQL honors the same exclusions as opengrep/SCA/secrets (its
-// extraction has no engine-side exclude, so its results are filtered here).
+// excluded path, so both taint engines honor the same exclusions as SCA/secrets/YARA:
+// CodeQL's extraction has no engine-side exclude, and opengrep's --exclude takes only
+// the ExcludedPaths patterns, not the scan unit's ExcludedDirs.
 func (s *SASTScanner) dropExcludedPaths(paths []taint.PathRecord) []taint.PathRecord {
 	out := paths[:0]
 	for _, p := range paths {

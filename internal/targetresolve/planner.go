@@ -30,14 +30,16 @@ const (
 )
 
 // rank orders relations by how closely they tie content to a target, so the
-// strongest wins when several apply.
+// strongest wins when several apply. It follows InclusionReason.rank: a
+// dependency's code outranks a test project's. RelationWorkspaceRoot is
+// assigned directly to a fallback lockfile's record and never ranked.
 func (r Relation) rank() int {
 	switch r {
 	case RelationDirect:
 		return 4
-	case RelationCompanion:
-		return 3
 	case RelationShared:
+		return 3
+	case RelationCompanion:
 		return 2
 	case RelationRepositoryGlobal:
 		return 1
@@ -45,8 +47,8 @@ func (r Relation) rank() int {
 	return 0
 }
 
-// ScanUnit is one physical scanner invocation. A unit may serve several
-// targets, but its root is scanned only once.
+// ScanUnit is one directory that each selected scanner scans once. A unit
+// may serve several targets.
 type ScanUnit struct {
 	ID           string              `json:"id"`
 	Root         string              `json:"-"`
@@ -63,24 +65,24 @@ type ScanUnit struct {
 	// targets relying on it. It is the shared-workspace-lockfile pattern: a
 	// workspace member declares its dependencies in its own manifest, but
 	// only the workspace root's lockfile pins their versions. Empty for a
-	// unit rooted at the repository root, which scans those files itself.
+	// unit rooted at the repository root, whose own files they are. See
+	// ScanPlan.NeedsRootLockfileCheck.
 	FallbackLockfiles map[string][]string `json:"fallbackLockfiles,omitempty"`
 }
 
-// ScansDependencies reports whether dependency (SCA) scanning runs on the
-// unit. A unit rooted at the repository root scans dependencies only when a
-// selected target's own project lives there; otherwise the root's
-// dependency files belong to no selected target.
-func (u *ScanUnit) ScansDependencies(repoRoot string) bool {
-	if filepath.Clean(u.Root) != filepath.Clean(repoRoot) {
-		return true
-	}
-	for _, relation := range u.Relations {
-		if relation == RelationDirect {
-			return true
+// NeedsRootLockfileCheck reports whether the repository root's own
+// lockfiles must be scanned on behalf of units that rely on them
+// (ScanUnit.FallbackLockfiles): no unit rooted at the repository root
+// scans them itself.
+func (p *ScanPlan) NeedsRootLockfileCheck() bool {
+	needed := false
+	for _, unit := range p.Units {
+		if filepath.Clean(unit.Root) == filepath.Clean(p.RepoRoot) {
+			return false
 		}
+		needed = needed || len(unit.FallbackLockfiles) > 0
 	}
-	return false
+	return needed
 }
 
 // PlanOptions selects the targets to plan and the paths to keep out of
@@ -104,6 +106,20 @@ type ScanPlan struct {
 	Unowned         []string
 	Ambiguous       []string
 	FileOwnership   map[string]*FileOwnership
+
+	// IncludesRepoGlobal is set when the plan also covers the repository
+	// content no selected target owns.
+	IncludesRepoGlobal bool
+
+	ownership ownershipModel
+}
+
+// Reports reports whether a finding credited to targetIDs belongs in the
+// plan's report: a selected target owns its file, or the plan covers
+// repository-global content. A unit reaches files no selected target owns
+// only when it scans an unselected project that encloses a selected one.
+func (p *ScanPlan) Reports(targetIDs []string) bool {
+	return p.IncludesRepoGlobal || len(targetIDs) > 0
 }
 
 // TargetPlanView is a selected target as shown in ScanPlanView.
@@ -135,10 +151,11 @@ func StructuredScanPlan(plan *ScanPlan) ScanPlanView {
 	return view
 }
 
-// buildInventory lists every file under repoRoot the scanners would see,
-// flags dependency manifests and lockfiles, and records which projects'
-// (and components') scan roots contain each file. MCP X-Ray's own generated
-// reports are returned separately as excluded.
+// buildInventory lists every file under repoRoot that the scanners see with
+// their default exclusions, flags dependency manifests and lockfiles, and
+// records which projects' (and components') scan roots contain each file,
+// with the innermost of those roots as its Ownership. MCP X-Ray's own
+// generated reports are returned separately as excluded.
 func buildInventory(repoRoot string, projects []*Project) ([]InventoryEntry, []string, error) {
 	var inventory []InventoryEntry
 	var excluded []string
@@ -149,14 +166,18 @@ func buildInventory(repoRoot string, projects []*Project) ([]InventoryEntry, []s
 			return nil
 		}
 		entry := InventoryEntry{Path: rel, Manifest: matchesManifest(info.Name()), Lockfile: matchesLockfile(info.Name()), Ownership: "unowned"}
+		owner := ""
 		for _, p := range projects {
 			if root := p.ScanRoot(); within(path, root) {
 				entry.ProjectIDs = append(entry.ProjectIDs, p.ID)
 				entry.ComponentIDs = append(entry.ComponentIDs, p.ComponentID)
-				if entry.Ownership == "unowned" {
-					entry.Ownership = repoRelative(repoRoot, root)
+				if len(root) > len(owner) {
+					owner = root
 				}
 			}
+		}
+		if owner != "" {
+			entry.Ownership = repoRelative(repoRoot, owner)
 		}
 		entry.ProjectIDs = uniqueSorted(entry.ProjectIDs)
 		entry.ComponentIDs = uniqueSorted(entry.ComponentIDs)
@@ -210,22 +231,32 @@ func BuildScanPlan(resolution *Resolution, options PlanOptions) (*ScanPlan, erro
 	}
 	sort.Slice(units, func(i, j int) bool { return units[i].ID < units[j].ID })
 
-	plan := &ScanPlan{RepoRoot: resolution.RepoRoot, SelectedTargets: selected, Units: units, Inventory: resolution.Inventory}
-	for _, entry := range plan.Inventory {
-		if entry.Ownership == "unowned" {
-			plan.Unowned = append(plan.Unowned, entry.Path)
-		}
-	}
-	plan.Excluded = uniqueSorted(append(append([]string(nil), resolution.Excluded...), generatedRelativeExcludes(resolution.RepoRoot, options)...))
-	for _, project := range resolution.Projects {
-		if project.OwnershipAmbiguous {
-			plan.Ambiguous = append(plan.Ambiguous, project.ID)
-		}
-	}
-	sort.Strings(plan.Ambiguous)
-	plan.FileOwnership = buildFileOwnership(resolution, buildComponentRelations(selected), selected)
+	plan := &ScanPlan{RepoRoot: resolution.RepoRoot, SelectedTargets: selected, Units: units, Inventory: resolution.Inventory, IncludesRepoGlobal: options.IncludeRepoGlobal}
+	plan.Unowned, plan.Excluded, plan.Ambiguous = scopeDiagnostics(resolution, options)
+	plan.ownership = newOwnershipModel(resolution, selected)
+	plan.FileOwnership = buildFileOwnership(resolution, plan.ownership)
 	applyWorkspaceRootFallbackOwnership(plan, selected)
 	return plan, nil
+}
+
+// scopeDiagnostics lists, sorted, the inventoried files no project owns,
+// the paths kept out of every scan, and the projects whose ownership is
+// ambiguous.
+func scopeDiagnostics(resolution *Resolution, options PlanOptions) (unowned, excluded, ambiguous []string) {
+	for _, entry := range resolution.Inventory {
+		if entry.Ownership == "unowned" {
+			unowned = append(unowned, entry.Path)
+		}
+	}
+	sort.Strings(unowned)
+	excluded = uniqueSorted(append(append([]string(nil), resolution.Excluded...), generatedRelativeExcludes(resolution.RepoRoot, options)...))
+	for _, project := range resolution.Projects {
+		if project.OwnershipAmbiguous {
+			ambiguous = append(ambiguous, project.ID)
+		}
+	}
+	sort.Strings(ambiguous)
+	return unowned, excluded, ambiguous
 }
 
 // selectTargets returns the targets options asks for. Every requested ID
@@ -343,16 +374,18 @@ func includedScanRoots(selected []*Target) map[string]bool {
 	return roots
 }
 
-// finalizeUnit fills in the unit's file lists and exclusions: generated
-// reports and, for a unit below the repository root, every discovered
-// project nested in it that no selected target includes. It then decides
-// which repository-root lockfiles the unit's targets need.
+// finalizeUnit fills in the unit's file lists and exclusions, then decides
+// which repository-root lockfiles the unit's targets need. A unit always
+// excludes generated reports. It also excludes every discovered project
+// nested in it that no selected target includes (nestedForeignExcludes),
+// unless the plan includes repository-global content: the unit is then the
+// one scan that covers those projects, whose files no target owns
+// (ownershipModel.of).
 func finalizeUnit(unit *ScanUnit, resolution *Resolution, selected []*Target, includedRoots map[string]bool, options PlanOptions) {
 	sort.Strings(unit.TargetIDs)
 	unit.Files, unit.Manifests, unit.Lockfiles = unitFiles(resolution.RepoRoot, unit.Root, resolution.Inventory)
 	unit.ExcludedDirs = append(unit.ExcludedDirs, generatedRelativeExcludes(unit.Root, options)...)
-	atRepoRoot := filepath.Clean(unit.Root) == filepath.Clean(resolution.RepoRoot)
-	if !atRepoRoot {
+	if !options.IncludeRepoGlobal {
 		unit.ExcludedDirs = append(unit.ExcludedDirs, nestedForeignExcludes(unit.Root, includedRoots, resolution.Projects)...)
 	}
 	for _, excluded := range resolution.Excluded {
@@ -362,7 +395,7 @@ func finalizeUnit(unit *ScanUnit, resolution *Resolution, selected []*Target, in
 		}
 	}
 	unit.ExcludedDirs = uniqueSorted(unit.ExcludedDirs)
-	if !atRepoRoot {
+	if filepath.Clean(unit.Root) != filepath.Clean(resolution.RepoRoot) {
 		unit.FallbackLockfiles = workspaceRootFallbackLockfiles(resolution, selected, unit)
 	}
 }
@@ -379,7 +412,7 @@ func buildComponentRelations(targets []*Target) map[string]Relation {
 				usage[cid] = make(map[string]InclusionReason)
 			}
 			reason := target.IncludedReasons[filepath.Clean(project.Dir)]
-			if reason.rank() > usage[cid][target.ID].rank() {
+			if existing, seen := usage[cid][target.ID]; !seen || reason.rank() > existing.rank() {
 				usage[cid][target.ID] = reason
 			}
 		}
@@ -401,34 +434,97 @@ func buildComponentRelations(targets []*Target) map[string]Relation {
 	return relations
 }
 
-// buildFileOwnership records, for every inventoried file (keyed by its
-// repository-relative POSIX path), the components and selected targets that
-// own it, its strongest relation to them and its context.
-func buildFileOwnership(resolution *Resolution, componentRelations map[string]Relation, targets []*Target) map[string]*FileOwnership {
-	componentTargets := make(map[string][]string)
-	for _, target := range targets {
+// ownershipModel decides which components and selected targets own a
+// file from the components whose roots contain it.
+type ownershipModel struct {
+	repoRoot           string
+	components         []*Component
+	rootDepth          map[string]int // component ID -> length of its root
+	componentTargets   map[string][]string
+	componentRelations map[string]Relation
+}
+
+func newOwnershipModel(resolution *Resolution, selected []*Target) ownershipModel {
+	model := ownershipModel{
+		repoRoot:           resolution.RepoRoot,
+		components:         resolution.Components,
+		rootDepth:          make(map[string]int, len(resolution.Components)),
+		componentTargets:   make(map[string][]string),
+		componentRelations: buildComponentRelations(selected),
+	}
+	for _, component := range resolution.Components {
+		model.rootDepth[component.ID] = len(filepath.Clean(component.Root))
+	}
+	for _, target := range selected {
 		for _, project := range target.Included {
-			cid := project.ComponentID
-			componentTargets[cid] = appendUniqueStr(componentTargets[cid], target.ID)
+			model.componentTargets[project.ComponentID] = appendUniqueStr(model.componentTargets[project.ComponentID], target.ID)
 		}
 	}
+	return model
+}
 
+// of is the ownership of the file at the repository-relative path rel that
+// the components componentIDs contain. The file belongs to the innermost of
+// them, the project nearest to it, not to every project enclosing that
+// one: a Go module nested in another, or an unselected project inside a
+// target's directory, is not the enclosing project's code. That component
+// gives the file its selected targets and relation.
+func (m ownershipModel) of(rel string, componentIDs []string) *FileOwnership {
+	owners := m.innermost(componentIDs)
+	fo := &FileOwnership{
+		ComponentIDs: owners,
+		Relation:     RelationRepositoryGlobal,
+		Context:      aggregation.ContextForPath(rel),
+	}
+	for _, cid := range owners {
+		fo.TargetIDs = appendUniqueStr(fo.TargetIDs, m.componentTargets[cid]...)
+		if relation := m.componentRelations[cid]; relation.rank() > fo.Relation.rank() {
+			fo.Relation = relation
+		}
+	}
+	sort.Strings(fo.TargetIDs)
+	sort.Strings(fo.ComponentIDs)
+	return fo
+}
+
+// innermost keeps, of componentIDs (components whose roots all lie on the
+// path to one file), the one with the deepest root. Components the model
+// does not know are kept as they are.
+func (m ownershipModel) innermost(componentIDs []string) []string {
+	deepest := -1
+	for _, cid := range componentIDs {
+		if d, ok := m.rootDepth[cid]; ok && d > deepest {
+			deepest = d
+		}
+	}
+	var owners []string
+	for _, cid := range componentIDs {
+		if d, ok := m.rootDepth[cid]; !ok || d == deepest {
+			owners = append(owners, cid)
+		}
+	}
+	return owners
+}
+
+// componentsContaining returns the IDs of the components whose root holds
+// the file at the repository-relative path rel.
+func (m ownershipModel) componentsContaining(rel string) []string {
+	abs := filepath.Join(m.repoRoot, filepath.FromSlash(rel))
+	var ids []string
+	for _, component := range m.components {
+		if within(abs, component.Root) {
+			ids = append(ids, component.ID)
+		}
+	}
+	return ids
+}
+
+// buildFileOwnership records the ownership of every inventoried file, keyed
+// by its repository-relative POSIX path.
+func buildFileOwnership(resolution *Resolution, model ownershipModel) map[string]*FileOwnership {
 	ownership := make(map[string]*FileOwnership, len(resolution.Inventory))
 	for _, entry := range resolution.Inventory {
-		fo := &FileOwnership{
-			ComponentIDs: entry.ComponentIDs,
-			Relation:     RelationRepositoryGlobal,
-			Context:      aggregation.ContextForPath(entry.Path),
-		}
-		for _, cid := range entry.ComponentIDs {
-			fo.TargetIDs = appendUniqueStr(fo.TargetIDs, componentTargets[cid]...)
-			if rel := componentRelations[cid]; rel.rank() > fo.Relation.rank() {
-				fo.Relation = rel
-			}
-		}
-		sort.Strings(fo.TargetIDs)
-		sort.Strings(fo.ComponentIDs)
-		ownership[entry.Path] = fo
+		ownership[entry.Path] = model.of(entry.Path, entry.ComponentIDs)
 	}
 	return ownership
 }
@@ -448,8 +544,9 @@ func appendUniqueStr(s []string, values ...string) []string {
 }
 
 // OwnershipOf returns the ownership of file, given as an absolute path or
-// relative to the repository root. A file outside the inventory belongs to
-// no selected target.
+// relative to the repository root. A file outside the inventory (one in a
+// directory the default exclusions skip, scanned because the run turned
+// them off) is owned by the components whose roots contain it.
 func (p *ScanPlan) OwnershipOf(file string) FileOwnership {
 	rel := file
 	if filepath.IsAbs(file) {
@@ -461,7 +558,7 @@ func (p *ScanPlan) OwnershipOf(file string) FileOwnership {
 	if ownership := p.FileOwnership[rel]; ownership != nil {
 		return *ownership
 	}
-	return FileOwnership{Relation: RelationRepositoryGlobal, Context: aggregation.ContextForPath(rel)}
+	return *p.ownership.of(rel, p.ownership.componentsContaining(rel))
 }
 
 // TargetSummaries describes every selected target -- including one with no

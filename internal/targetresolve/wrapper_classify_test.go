@@ -1,6 +1,7 @@
 package targetresolve
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -98,5 +99,151 @@ func TestPromoteWrapperServers_EvidenceIsDeterministic(t *testing.T) {
 		} else if evidence != first {
 			t.Fatalf("run %d evidence differs:\n  %q\nvs\n  %q", run, evidence, first)
 		}
+	}
+}
+
+// A Cloudflare Worker that serves a workspace library's MCP server is a
+// wrapper: its Wrangler configuration declares the entry module it runs.
+func TestPromoteWrapperServers_WorkerEntrypoint(t *testing.T) {
+	root := t.TempDir()
+	server := &Project{Name: "mcp-common", Dir: filepath.Join(root, "packages", "common"), Ecosystem: "node", Role: RoleMCPServer}
+	worker := &Project{Name: "radar", Dir: filepath.Join(root, "apps", "radar"), Ecosystem: "node", Role: RoleUnrelated}
+	worker.LocalDeps = []string{server.Dir}
+	writeFile(t, filepath.Join(worker.Dir, "wrangler.jsonc"), "{\n\t// the Worker\n\t\"name\": \"radar\",\n\t\"main\": \"src/radar.app.ts\"\n}\n")
+
+	promoteWrapperServers([]*Project{server, worker})
+
+	if worker.Role != RoleMCPServer {
+		t.Errorf("worker role = %v, want it promoted", worker.Role)
+	}
+	writeFile(t, filepath.Join(root, "toml", "wrangler.toml"), "name = \"x\"\nmain = \"src/index.ts\"\n")
+	if !hasWorkerEntrypoint(&Project{Dir: filepath.Join(root, "toml")}) {
+		t.Error("a wrangler.toml with main is a Worker entrypoint")
+	}
+	writeFile(t, filepath.Join(root, "nomain", "wrangler.toml"), "name = \"x\"\n")
+	if hasWorkerEntrypoint(&Project{Dir: filepath.Join(root, "nomain")}) {
+		t.Error("a Wrangler configuration without main declares no entrypoint")
+	}
+}
+
+// A client of a server (a test client or benchmark that launches it) is not
+// a wrapper of it, however launchable it is.
+func TestPromoteWrapperServers_ClientWithClientCodeIsNotPromoted(t *testing.T) {
+	root := t.TempDir()
+	server := &Project{Name: "server", Dir: filepath.Join(root, "server"), Ecosystem: "node", Role: RoleMCPServer}
+	client := &Project{Name: "test-client", Dir: filepath.Join(root, "test-client"), Ecosystem: "node", Role: RoleMCPClient, BinNames: []string{"test-client"}}
+	client.LocalDeps = []string{server.Dir}
+	writeFile(t, filepath.Join(client.Dir, "index.ts"), `import { Client } from "@modelcontextprotocol/sdk/client/index.js";`+"\n")
+
+	promoteWrapperServers([]*Project{server, client})
+
+	if client.Role != RoleMCPClient {
+		t.Errorf("client role = %v, want it left a client", client.Role)
+	}
+}
+
+// A dependency the project needs only for development (a Python dependency
+// group) does not make it a wrapper of the server it pulls in.
+func TestPromoteWrapperServers_DevelopmentDependencyDoesNotPromote(t *testing.T) {
+	root := t.TempDir()
+	examplesDir := filepath.Join(root, "examples")
+	writeFile(t, filepath.Join(root, "src", "cli.py"), "def main():\n    app.run()\n")
+	server := &Project{Name: "examples", Dir: examplesDir, Ecosystem: "python", Role: RoleMCPServer}
+	sdk := &Project{Name: "mcp", Dir: root, Ecosystem: "python", Role: RoleUnrelated}
+	sdk.LocalDeps = []string{server.Dir}
+
+	promoteWrapperServers([]*Project{server, sdk})
+	if sdk.Role != RoleMCPServer {
+		t.Fatalf("role = %v; with a runtime dependency the fixture must promote, or the test proves nothing", sdk.Role)
+	}
+
+	sdk.Role, sdk.Evidence = RoleUnrelated, nil
+	sdk.DevLocalDeps = []string{server.Dir}
+	promoteWrapperServers([]*Project{server, sdk})
+	if sdk.Role != RoleUnrelated {
+		t.Errorf("role = %v, want unrelated: the server is only a development dependency", sdk.Role)
+	}
+}
+
+// A deployed Worker that also talks to MCP servers as a client (a chat UI
+// next to the hosted server) is still a wrapper of the server it serves.
+func TestPromoteWrapperServers_WorkerWithClientCodeIsPromoted(t *testing.T) {
+	root := t.TempDir()
+	core := &Project{Name: "core", Dir: filepath.Join(root, "core"), Ecosystem: "node", Role: RoleMCPServer}
+	worker := &Project{Name: "hosted", Dir: filepath.Join(root, "hosted"), Ecosystem: "node", Role: RoleMCPClient}
+	worker.LocalDeps = []string{core.Dir}
+	writeFile(t, filepath.Join(worker.Dir, "wrangler.jsonc"), `{"main": "src/index.ts"}`)
+	writeFile(t, filepath.Join(worker.Dir, "src", "chat.ts"), `import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";`+"\n")
+
+	promoteWrapperServers([]*Project{core, worker})
+
+	if worker.Role != RoleMCPServer {
+		t.Errorf("role = %v, want the Worker promoted", worker.Role)
+	}
+}
+
+func TestHasWorkerEntrypoint(t *testing.T) {
+	cases := []struct {
+		name, file, content string
+		want                bool
+	}{
+		{"JSONC with comments and trailing commas", "wrangler.jsonc", "{\n  // entry\n  \"name\": \"x\", /* \"main\": \"no\" */\n  \"main\": \"src/index.ts\",\n}\n", true},
+		{"one-line JSON", "wrangler.json", `{"name":"x","main":"src/index.ts"}`, true},
+		{"main only for an environment", "wrangler.toml", "name = \"x\"\n[env.production]\nmain = \"src/index.ts\"\n", true},
+		{"TOML", "wrangler.toml", "name = \"x\"\nmain = \"src/index.ts\"\n", true},
+		{"main in [vars] is a variable", "wrangler.toml", "name = \"x\"\n[vars]\nmain = \"production\"\n", false},
+		{"main only in a comment", "wrangler.jsonc", "{\n  /* \"main\": \"src/index.ts\" */\n  \"name\": \"x\"\n}\n", false},
+		{"a URL in a string is not a comment", "wrangler.jsonc", `{"name": "x", "route": "https://example.com/*", "main": "src/index.ts"}`, true},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		writeFile(t, filepath.Join(dir, tc.file), tc.content)
+		if got := hasWorkerEntrypoint(&Project{Dir: dir}); got != tc.want {
+			t.Errorf("%s: hasWorkerEntrypoint = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A script launches a server only when a runner runs a file of the project
+// that starts a server: not a build, test or client script, not a file
+// outside the project, and not an unparsable script value.
+func TestNodeScriptStartsServer(t *testing.T) {
+	const server = "import { serveStdio } from \"@modelcontextprotocol/server/stdio\";\nvoid serveStdio(buildServer);\n"
+	const client = "import { Client } from \"@modelcontextprotocol/client\";\nawait client.connect(transport);\n"
+	const library = "import { McpServer } from \"@modelcontextprotocol/server\";\nexport const start = (s, t) => s.connect(t);\n"
+	cases := []struct {
+		name, scripts string
+		want          bool
+	}{
+		{"tsx runs the server", `{"start": "tsx server.ts"}`, true},
+		{"node behind env and npx", `{"start": "cross-env PORT=1 npx tsx ./server.ts --http"}`, true},
+		{"a build entry is not run", `{"build": "esbuild src/entry.ts --bundle"}`, false},
+		{"a client script", `{"client": "tsx client.ts"}`, false},
+		{"a file outside the project", `{"start": "tsx ../other/server.ts"}`, false},
+		{"npm comment keys are skipped", `{"//": ["run with npm start"], "start": "tsx server.ts"}`, true},
+	}
+	for _, tc := range cases {
+		root := t.TempDir()
+		dir := filepath.Join(root, "app")
+		writeFile(t, filepath.Join(dir, "package.json"), `{"name": "app", "scripts": `+tc.scripts+`}`)
+		writeFile(t, filepath.Join(dir, "server.ts"), server)
+		writeFile(t, filepath.Join(dir, "client.ts"), client)
+		writeFile(t, filepath.Join(dir, "src", "entry.ts"), library)
+		writeFile(t, filepath.Join(root, "other", "server.ts"), server)
+		p := &Project{Dir: dir, ManifestPath: filepath.Join(dir, "package.json"), Ecosystem: "node"}
+		if got := nodeScriptStartsServer(p, []*Project{p}); got != tc.want {
+			t.Errorf("%s: nodeScriptStartsServer = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestJSONCToJSON(t *testing.T) {
+	in := "\xef\xbb\xbf{\n  \"a\": \"x\\\" // not a comment\", // comment\n  \"b\": [1, 2,],\n}"
+	var got map[string]interface{}
+	if err := json.Unmarshal(jsoncToJSON([]byte(in)), &got); err != nil {
+		t.Fatalf("jsoncToJSON produced invalid JSON: %v (%q)", err, jsoncToJSON([]byte(in)))
+	}
+	if got["a"] != `x" // not a comment` {
+		t.Errorf("a = %q; an escaped quote must not end the string", got["a"])
 	}
 }

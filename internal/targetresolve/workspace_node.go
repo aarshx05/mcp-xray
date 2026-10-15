@@ -62,6 +62,7 @@ func newNodeProject(manifestPath string) (*Project, error) {
 
 	return &Project{
 		Name:         name,
+		PackageName:  pkg.Name,
 		Dir:          dir,
 		Ecosystem:    "node",
 		ManifestPath: manifestPath,
@@ -170,10 +171,12 @@ func resolveNodeLocalDeps(projects []*Project) {
 			default:
 				// A plain version ("@twilio-alpha/openapi-mcp-server":
 				// "0.7.0") on a package another project in this repository
-				// declares is workspace-local: npm, yarn and pnpm
-				// workspaces link it to the sibling. As with Go module
-				// paths, a published package that shares a local package's
-				// name would be mistaken for it; telling them apart needs a
+				// declares is treated as workspace-local: a workspace
+				// package manager links it to the sibling when the
+				// sibling's version satisfies it (pnpm only with
+				// link-workspace-packages). As with Go module paths, a
+				// published package that shares a local package's name
+				// would be mistaken for it; telling them apart needs a
 				// registry lookup.
 				if looksLikeRegistryVersionSpecifier(depValue) {
 					if dep, ok := byName[depName]; ok && dep != p {

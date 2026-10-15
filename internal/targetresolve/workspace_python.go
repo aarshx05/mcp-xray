@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -47,15 +48,18 @@ func newPythonProject(manifestPath string) (*Project, error) {
 	}
 
 	dir := filepath.Dir(manifestPath)
-	name := filepath.Base(dir)
-	if n, ok := stringAt(doc, "project", "name"); ok {
-		name = n
-	} else if n, ok := stringAt(doc, "tool", "poetry", "name"); ok {
-		name = n
+	packageName, ok := stringAt(doc, "project", "name")
+	if !ok {
+		packageName, _ = stringAt(doc, "tool", "poetry", "name")
+	}
+	name := packageName
+	if name == "" {
+		name = filepath.Base(dir)
 	}
 
 	return &Project{
 		Name:         name,
+		PackageName:  packageName,
 		Dir:          dir,
 		Ecosystem:    "python",
 		ManifestPath: manifestPath,
@@ -103,10 +107,11 @@ func resolvePythonLocalDeps(projects []*Project) {
 			continue
 		}
 
+		runtime := pythonRuntimeDependencies(doc)
 		for _, depTable := range poetryDependencyTables(doc) {
-			for _, dep := range depTable {
+			for depName, dep := range depTable {
 				if path, ok := pathFromInlineTable(dep); ok {
-					resolvePyPathDep(p, byDir, path)
+					resolvePyPathDep(p, byDir, path, !runtime[normalizePEP503(depName)])
 				}
 			}
 		}
@@ -117,13 +122,14 @@ func resolvePythonLocalDeps(projects []*Project) {
 				if !ok {
 					continue
 				}
+				devOnly := !runtime[normalizePEP503(depName)]
 				if path, ok := pathFromInlineTable(inline); ok {
-					resolvePyPathDep(p, byDir, path)
+					resolvePyPathDep(p, byDir, path, devOnly)
 					continue
 				}
 				if ws, ok := inline["workspace"].(bool); ok && ws {
 					if dep, ok := byName[normalizePEP503(depName)]; ok && dep != p {
-						addLocalDep(p, dep.Dir)
+						addPythonLocalDep(p, dep, devOnly)
 					}
 				}
 			}
@@ -156,11 +162,52 @@ func poetryDependencyTables(doc map[string]interface{}) []map[string]interface{}
 	return tables
 }
 
-func resolvePyPathDep(p *Project, byDir map[string]*Project, relPath string) {
+func resolvePyPathDep(p *Project, byDir map[string]*Project, relPath string, devOnly bool) {
 	targetDir := filepath.Clean(filepath.Join(p.Dir, relPath))
 	if dep, ok := byDir[targetDir]; ok && dep != p {
-		addLocalDep(p, dep.Dir)
+		addPythonLocalDep(p, dep, devOnly)
 	}
+}
+
+// addPythonLocalDep records p's dependency on dep, marking it development
+// only when p does not need it to run.
+func addPythonLocalDep(p, dep *Project, devOnly bool) {
+	addLocalDep(p, dep.Dir)
+	if devOnly {
+		if i, found := slices.BinarySearch(p.DevLocalDeps, dep.Dir); !found {
+			p.DevLocalDeps = slices.Insert(p.DevLocalDeps, i, dep.Dir)
+		}
+	}
+}
+
+// pythonRuntimeDependencies returns the PEP 503 names of the distributions
+// a project needs to run: [project].dependencies and optional-dependencies,
+// and Poetry's main dependency table. Dependency groups are development
+// only: they are never installed with the package.
+func pythonRuntimeDependencies(doc map[string]interface{}) map[string]bool {
+	runtime := make(map[string]bool)
+	addSpecs := func(value interface{}) {
+		specs, _ := value.([]interface{})
+		for _, spec := range specs {
+			if s, ok := spec.(string); ok {
+				runtime[normalizePEP503(pep508PackageName(s))] = true
+			}
+		}
+	}
+	if deps, ok := valueAt(doc, "project", "dependencies"); ok {
+		addSpecs(deps)
+	}
+	if extras, ok := mapAt(doc, "project", "optional-dependencies"); ok {
+		for _, deps := range extras {
+			addSpecs(deps)
+		}
+	}
+	if deps, ok := mapAt(doc, "tool", "poetry", "dependencies"); ok {
+		for name := range deps {
+			runtime[normalizePEP503(name)] = true
+		}
+	}
+	return runtime
 }
 
 func pathFromInlineTable(v interface{}) (string, bool) {

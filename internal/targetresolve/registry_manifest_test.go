@@ -252,6 +252,87 @@ func TestApplyRegistryManifestSignals_RemotesOnlyOnExistingProjectDowngradesNotO
 	}
 }
 
+// A remotes-only manifest next to a project whose own source constructs a
+// server (a local stdio proxy for a hosted server, say) leaves it a server:
+// there is local code to scan.
+func TestApplyRegistryManifestSignals_RemotesOnlyKeepsAProjectWithServerSource(t *testing.T) {
+	root := t.TempDir()
+	serverDir := filepath.Join(root, "proxy")
+	writeFile(t, filepath.Join(serverDir, "server.json"), `{
+  "name": "com.example/proxy",
+  "remotes": [ { "type": "streamable-http", "url": "https://example.com/mcp" } ]
+}`)
+	existing := &Project{Name: "proxy", Dir: serverDir, Ecosystem: "node", Role: RoleMCPServer}
+	if _, err := applyRegistryManifestSignals(root, []*Project{existing}); err != nil {
+		t.Fatal(err)
+	}
+	if existing.Role != RoleMCPServer || existing.RoleConfirmedByManifest {
+		t.Errorf("role = %v, confirmed = %v; want an unconfirmed server", existing.Role, existing.RoleConfirmedByManifest)
+	}
+}
+
+// A server.json at a workspace root names the package that is the server;
+// that package's project is what it describes, not the workspace root, and
+// the root does not become everyone's ownership boundary.
+func TestApplyRegistryManifestSignals_NamedPackageIsTheDescribedProject(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "server.json"), `{
+  "name": "com.example/server",
+  "packages": [ { "registryType": "npm", "identifier": "@example/mcp-server" } ]
+}`)
+	workspace := &Project{Name: "example-monorepo", PackageName: "example-monorepo", Dir: root, RelDir: ".", Ecosystem: "node", Role: RoleUnrelated}
+	server := &Project{Name: "@example/mcp-server", PackageName: "@example/mcp-server", Dir: filepath.Join(root, "packages", "server"), RelDir: "packages/server", Ecosystem: "node", Role: RoleUnrelated}
+	other := &Project{Name: "@example/other", PackageName: "@example/other", Dir: filepath.Join(root, "packages", "other"), RelDir: "packages/other", Ecosystem: "node", Role: RoleMCPServer}
+	projects := []*Project{workspace, server, other}
+
+	if _, err := applyRegistryManifestSignals(root, projects); err != nil {
+		t.Fatal(err)
+	}
+	if server.Role != RoleMCPServer || !server.RoleConfirmedByManifest || server.Name != "com.example/server" {
+		t.Errorf("named package = %+v, want the confirmed server", server)
+	}
+	if workspace.Role != RoleUnrelated {
+		t.Errorf("workspace root role = %v, want it left as classified", workspace.Role)
+	}
+	if isOwnershipBoundary(root, projects) {
+		t.Error("a root server.json that names a nested package must not be an ownership boundary")
+	}
+
+	assignIdentities(root, projects)
+	if other.ComponentID == server.ComponentID {
+		t.Error("the other server must keep a component of its own")
+	}
+}
+
+func TestRegistryManifestHit_PublishingProject(t *testing.T) {
+	root := t.TempDir()
+	py := &Project{Dir: filepath.Join(root, "py"), Ecosystem: "python", PackageName: "Weather_MCP.Server"}
+	node := &Project{Dir: filepath.Join(root, "node"), Ecosystem: "node", PackageName: "@acme/weather"}
+	nodeTwin := &Project{Dir: filepath.Join(root, "twin"), Ecosystem: "node", PackageName: "@acme/weather"}
+	outside := &Project{Dir: filepath.Join(filepath.Dir(root), "elsewhere"), Ecosystem: "node", PackageName: "@acme/other"}
+	pypi := registryManifestHit{Dir: root, Packages: []registryPackage{{RegistryType: "pypi", Identifier: "weather-mcp-server"}}}
+	npm := registryManifestHit{Dir: root, Packages: []registryPackage{{RegistryType: "npm", Identifier: "@acme/weather"}}}
+	if got := pypi.publishingProject([]*Project{py, node}); got != py {
+		t.Errorf("PyPI names are compared PEP 503 normalized; got %+v", got)
+	}
+	if got := npm.publishingProject([]*Project{node, nodeTwin}); got != nil {
+		t.Errorf("two projects publishing the package is ambiguous; got %+v", got)
+	}
+	other := registryManifestHit{Dir: root, Packages: []registryPackage{{RegistryType: "npm", Identifier: "@acme/other"}}}
+	if got := other.publishingProject([]*Project{outside}); got != nil {
+		t.Errorf("a project outside the manifest's directory is never described; got %+v", got)
+	}
+}
+
+func TestReadRegistryManifest_SkipsPlaceholderPackages(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "x", "packages": [{"registryType": "nuget", "identifier": "<<DnxPackageId>>"}, {"registryType": "npm", "identifier": "@acme/x"}]}`)
+	hit, ok := readRegistryManifest(filepath.Join(dir, "server.json"))
+	if !ok || !hit.HasLocalPackages || len(hit.Packages) != 1 || hit.Packages[0].Identifier != "@acme/x" {
+		t.Errorf("hit = %+v, %v; want the npm package only", hit, ok)
+	}
+}
+
 func TestApplyRegistryManifestSignals_DescendantServerJSONUpgradesNestedProject(t *testing.T) {
 	// Reproduces the real microsoft/mcp shape: server.json sits one
 	// directory above the actual manifest.
