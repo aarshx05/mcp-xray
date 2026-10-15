@@ -149,3 +149,25 @@ def test_something():
 		t.Errorf("expected the test file (no __main__/run call) to not classify RoleMCPServer, got %v", testRole)
 	}
 }
+
+// A pyproject.toml holding only tool settings packages nothing: a
+// standalone server script below one is still discovered.
+func TestDiscoverLegacyPythonScripts_LintOnlyAncestorPyproject(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "pyproject.toml"), "[tool.ruff]\nline-length = 100\n")
+	writeFile(t, filepath.Join(root, "servers", "weather", "server.py"), `
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("weather")
+
+if __name__ == "__main__":
+    mcp.run()
+`)
+
+	projects, err := discoverLegacyPythonScripts(root)
+	if err != nil {
+		t.Fatalf("discoverLegacyPythonScripts returned error: %v", err)
+	}
+	if len(projects) != 1 || projects[0].Name != "server" {
+		t.Fatalf("candidates = %+v, want the weather server script", projects)
+	}
+}

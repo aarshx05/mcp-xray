@@ -2,7 +2,6 @@ package targetresolve
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,6 +19,8 @@ type nodePackageJSON struct {
 	DevDependencies      map[string]string `json:"devDependencies"`
 	PeerDependencies     map[string]string `json:"peerDependencies"`
 	OptionalDependencies map[string]string `json:"optionalDependencies"`
+	// Scripts are kept raw: npm's "//" comment entries need not be strings.
+	Scripts map[string]json.RawMessage `json:"scripts"`
 }
 
 func (p *nodePackageJSON) allDependencies() map[string]string {
@@ -36,12 +37,8 @@ func (p *nodePackageJSON) allDependencies() map[string]string {
 // package.json needs (project construction, local-dep resolution, role
 // signal detection).
 func readPackageJSON(manifestPath string) (*nodePackageJSON, error) {
-	data, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return nil, err
-	}
 	var pkg nodePackageJSON
-	if err := json.Unmarshal(data, &pkg); err != nil {
+	if err := readJSONFile(manifestPath, &pkg); err != nil {
 		return nil, err
 	}
 	return &pkg, nil
@@ -118,7 +115,7 @@ func binNameFromPackageName(name string) string {
 //   - the pnpm/yarn/npm "workspace:" protocol (e.g. "workspace:*"), where the
 //     dependency KEY is normally the sibling package's declared "name" --
 //     resolved by matching against every other discovered Node project's
-//     Name -- unless the spec itself names the sibling, as an alias
+//     PackageName -- unless the spec itself names the sibling, as an alias
 //     ("workspace:real-pkg@*") or a relative path ("workspace:../real-pkg");
 //     see resolveNodeWorkspaceDep.
 //   - the "file:"/"link:" protocol, where the VALUE is a relative filesystem
@@ -142,7 +139,12 @@ func resolveNodeLocalDeps(projects []*Project) {
 		if p.Ecosystem != "node" {
 			continue
 		}
-		byName[p.Name] = p
+		// Only a declared name can be depended on: an unnamed package.json
+		// (examples/hono) is no "hono" package, whatever its directory is
+		// called.
+		if p.PackageName != "" {
+			byName[p.PackageName] = p
+		}
 		byDir[filepath.Clean(p.Dir)] = p
 	}
 	if len(byDir) == 0 {

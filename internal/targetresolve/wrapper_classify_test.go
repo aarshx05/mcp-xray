@@ -221,12 +221,14 @@ func TestNodeScriptStartsServer(t *testing.T) {
 		{"a client script", `{"client": "tsx client.ts"}`, false},
 		{"a file outside the project", `{"start": "tsx ../other/server.ts"}`, false},
 		{"npm comment keys are skipped", `{"//": ["run with npm start"], "start": "tsx server.ts"}`, true},
+		{"a test's server is not the program's", `{"test:e2e": "tsx test/server.ts"}`, false},
 	}
 	for _, tc := range cases {
 		root := t.TempDir()
 		dir := filepath.Join(root, "app")
 		writeFile(t, filepath.Join(dir, "package.json"), `{"name": "app", "scripts": `+tc.scripts+`}`)
 		writeFile(t, filepath.Join(dir, "server.ts"), server)
+		writeFile(t, filepath.Join(dir, "test", "server.ts"), server)
 		writeFile(t, filepath.Join(dir, "client.ts"), client)
 		writeFile(t, filepath.Join(dir, "src", "entry.ts"), library)
 		writeFile(t, filepath.Join(root, "other", "server.ts"), server)
@@ -245,5 +247,76 @@ func TestJSONCToJSON(t *testing.T) {
 	}
 	if got["a"] != `x" // not a comment` {
 		t.Errorf("a = %q; an escaped quote must not end the string", got["a"])
+	}
+}
+
+// A dependency on a directory that also holds another ecosystem's project (a
+// pyproject.toml of tool settings beside the package.json) still reaches the
+// package the wrapper depends on.
+func TestPromoteWrapperServers_DependencyDirectorySharedWithAnotherEcosystem(t *testing.T) {
+	coreNode := &Project{Name: "core-server", Dir: "/repo/core", Ecosystem: "node", Role: RoleMCPServer}
+	corePython := &Project{Name: "core-py", Dir: "/repo/core", Ecosystem: "python", Role: RoleUnrelated}
+	cli := &Project{Name: "cli", Dir: "/repo/cli", Ecosystem: "node", Role: RoleUnrelated, BinNames: []string{"cli"}}
+	cli.LocalDeps = []string{coreNode.Dir}
+
+	promoteWrapperServers([]*Project{cli, coreNode, corePython})
+
+	if cli.Role != RoleMCPServer {
+		t.Errorf("cli role = %v, want mcp-server (a wrapper of core-server)", cli.Role)
+	}
+}
+
+// Entrypoint evidence means the program starts a server, not that some
+// method named run, connect or listen is called: a test's t.Run, an
+// exec.Cmd, a database connection, a mock server, a subprocess or a command
+// handler's RunAsync are no startup.
+func TestHasOwnEntrypointEvidence(t *testing.T) {
+	cases := []struct {
+		name, ecosystem, file, source string
+		want                          bool
+	}{
+		{"go main running the server", "go", "main.go", "package main\n\nfunc main() {\n\tif err := core.New().Run(context.Background(), &mcp.StdioTransport{}); err != nil {\n\t\tpanic(err)\n\t}\n}\n", true},
+		{"go main serving HTTP", "go", "main.go", "package main\n\nfunc main() {\n\thttp.ListenAndServe(\":8080\", core.Handler())\n}\n", true},
+		{"go main running a command", "go", "main.go", "package main\n\nfunc main() {\n\texec.Command(\"go\", \"generate\").Run()\n}\n", false},
+		{"go library running a server", "go", "serve.go", "package core\n\nfunc Serve(ctx context.Context, s *mcp.Server) error {\n\treturn s.Run(ctx, &mcp.StdioTransport{})\n}\n", false},
+		{"go test helper", "go", "testutil.go", "package main\n\nfunc main() {}\n\nfunc check(t *testing.T) {\n\tt.Run(\"paris\", func(t *testing.T) {})\n}\n", false},
+		{"node server on a transport", "node", "index.ts", "await server.connect(new StdioServerTransport());\n", true},
+		{"node HTTP server", "node", "index.ts", "app.listen(PORT, () => console.log(\"up\"));\n", true},
+		{"node database connection", "node", "db.ts", "await pool.connect();\nawait mongoose.connect(uri);\n", false},
+		{"node mock server", "node", "start.ts", "mswServer.listen({\n  onUnhandledRequest: (req, print) => print.warning(),\n});\n", false},
+		{"python server run", "python", "server.py", "mcp.run(transport=\"stdio\")\n", true},
+		{"python async main", "python", "server.py", "asyncio.run(main())\n", true},
+		{"python subprocess and agent", "python", "tool.py", "subprocess.run([\"git\", \"status\"])\nresult = agent.run(prompt)\n", false},
+		{".NET host", "dotnet", "Program.cs", "await builder.Build().RunAsync();\n", true},
+		{".NET web application", "dotnet", "Program.cs", "var app = builder.Build();\napp.MapMcp();\napp.Run();\n", true},
+		{".NET command handler", "dotnet", "RunPipelineCommand.cs", "var result = await _handler.RunAsync(workspaceId, pipelineId);\nawait Task.Run(() => Work());\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, tc.file), tc.source)
+			p := &Project{Name: "p", Dir: dir, Ecosystem: tc.ecosystem}
+			if got := hasOwnEntrypointEvidence(p, []*Project{p}); got != tc.want {
+				t.Errorf("hasOwnEntrypointEvidence = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A .NET tool whose command calls a handler's RunAsync is not a program
+// wrapping the core server it references, so the core stays the target.
+func TestResolve_CommandHandlerRunIsNotAWrapperEntrypoint(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "core", "Core.csproj"), `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="ModelContextProtocol" /></ItemGroup></Project>`)
+	writeFile(t, filepath.Join(root, "core", "Ext.cs"), "public static class Ext { public static void Register(IServiceCollection s) { s.AddMcpServer(); } }\n")
+	writeFile(t, filepath.Join(root, "tools", "Pipelines", "Pipelines.csproj"), `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="..\\..\\core\\Core.csproj" /></ItemGroup></Project>`)
+	writeFile(t, filepath.Join(root, "tools", "Pipelines", "RunPipelineCommand.cs"), "public class RunPipelineCommand { public async Task Exec() { var r = await _handler.RunAsync(workspaceId, pipelineId); } }\n")
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if names := targetNames(resolution.Targets); len(names) != 1 || names[0] != "Core" {
+		t.Errorf("targets = %v, want only Core", names)
 	}
 }

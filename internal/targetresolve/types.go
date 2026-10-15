@@ -118,9 +118,11 @@ type Project struct {
 
 	// LocalDeps is the set of other Project.Dir values this project depends
 	// on via a workspace-local (path-based) dependency declaration, as
-	// opposed to a registry dependency. Only workspace-local edges are
-	// tracked here; registry dependencies are already handled by the
-	// existing SCA scanner and are out of scope for this package.
+	// opposed to a registry dependency; an entry means the project of this
+	// project's ecosystem in that directory (projectDirs.dep). Only
+	// workspace-local edges are tracked here; registry dependencies are
+	// already handled by the existing SCA scanner and are out of scope for
+	// this package.
 	LocalDeps []string
 
 	// DevLocalDeps is the subset of LocalDeps the project needs only for
@@ -128,9 +130,9 @@ type Project struct {
 	// it runs.
 	DevLocalDeps []string
 
-	// LocalDepIDs is the stable-ID form of LocalDeps. LocalDeps remains for
-	// compatibility with existing ecosystem adapters and callers; graph
-	// planning uses this field when it is populated.
+	// LocalDepIDs is the stable-ID form of LocalDeps, filled in once every
+	// project has its ID, for the machine-readable listing. The graph itself
+	// follows LocalDeps (projectDirs.dep).
 	LocalDepIDs []string
 
 	// ComponentID identifies the logical ownership component containing this

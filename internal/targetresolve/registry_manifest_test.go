@@ -294,7 +294,7 @@ func TestApplyRegistryManifestSignals_NamedPackageIsTheDescribedProject(t *testi
 	if workspace.Role != RoleUnrelated {
 		t.Errorf("workspace root role = %v, want it left as classified", workspace.Role)
 	}
-	if isOwnershipBoundary(root, projects) {
+	if isOwnershipBoundary(root, root, projects) {
 		t.Error("a root server.json that names a nested package must not be an ownership boundary")
 	}
 
@@ -327,7 +327,7 @@ func TestRegistryManifestHit_PublishingProject(t *testing.T) {
 func TestReadRegistryManifest_SkipsPlaceholderPackages(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "x", "packages": [{"registryType": "nuget", "identifier": "<<DnxPackageId>>"}, {"registryType": "npm", "identifier": "@acme/x"}]}`)
-	hit, ok := readRegistryManifest(filepath.Join(dir, "server.json"))
+	hit, ok := readRegistryManifest(dir, filepath.Join(dir, "server.json"))
 	if !ok || !hit.HasLocalPackages || len(hit.Packages) != 1 || hit.Packages[0].Identifier != "@acme/x" {
 		t.Errorf("hit = %+v, %v; want the npm package only", hit, ok)
 	}
@@ -391,5 +391,94 @@ func TestApplyRegistryManifestSignals_NoManifestsIsNoOp(t *testing.T) {
 	}
 	if len(projects) != 1 || projects[0].Role != RoleUnrelated {
 		t.Errorf("expected projects unchanged when no server.json exists, got %+v", projects)
+	}
+}
+
+// A server.json among tests, fixtures, documentation or examples is a sample
+// of the format, not a description of a server in this repository.
+func TestIsSampleManifestPath(t *testing.T) {
+	cases := map[string]bool{
+		"server.json":                        false,
+		"servers/weather/server.json":        false,
+		"packages/core/src/data/server.json": false,
+		"test/fixtures/valid/server.json":    true,
+		"docs/examples/server.json":          true,
+		"examples/weather/server.json":       true,
+		"src/Weather.Tests/server.json":      true,
+		"pkg/weather_test/server.json":       true,
+	}
+	for relPath, want := range cases {
+		if got := isSampleManifestPath(relPath); got != want {
+			t.Errorf("isSampleManifestPath(%q) = %v, want %v", relPath, got, want)
+		}
+	}
+}
+
+func TestResolve_SampleServerJSONIsNotAServer(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "my-mcp", "bin": {"my-mcp": "dist/index.js"}, "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+	writeFile(t, filepath.Join(root, "src", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	sample := `{"name": "io.example/fixture", "packages": [{"registryType": "npm", "identifier": "fixture-pkg"}]}`
+	writeFile(t, filepath.Join(root, "test", "fixtures", "valid", "server.json"), sample)
+	writeFile(t, filepath.Join(root, "docs", "examples", "server.json"), sample)
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if names := targetNames(resolution.Targets); len(names) != 1 || names[0] != "my-mcp" {
+		t.Errorf("targets = %v, want only my-mcp", names)
+	}
+}
+
+// A server.json naming a package no project here publishes (a container
+// image) above several independent servers describes one of them, but
+// nothing says which: it neither merges them into one target nor becomes a
+// server of its own, whether or not a workspace manifest sits beside it.
+func TestResolve_UntiedManifestAboveSeveralServersOwnsNone(t *testing.T) {
+	for name, workspaceRoot := range map[string]bool{"no root project": false, "workspace root project": true} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFile(t, filepath.Join(root, "server.json"), `{"name": "io.github.acme/a", "packages": [{"registryType": "oci", "identifier": "ghcr.io/acme/a:1.0"}]}`)
+			if workspaceRoot {
+				writeFile(t, filepath.Join(root, "package.json"), `{"name": "acme-servers", "private": true}`)
+			}
+			for _, server := range []string{"a", "b"} {
+				dir := filepath.Join(root, "servers", server)
+				writeFile(t, filepath.Join(dir, "package.json"), `{"name": "srv-`+server+`", "bin": "dist/index.js", "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+				writeFile(t, filepath.Join(dir, "src", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+			}
+
+			resolution, err := Resolve(root)
+			if err != nil {
+				t.Fatalf("Resolve returned error: %v", err)
+			}
+			names := targetNames(resolution.Targets)
+			if len(names) != 2 || len(resolution.Warnings) != 0 {
+				t.Errorf("targets = %v, warnings = %v; want srv-a and srv-b, unambiguous", names, resolution.Warnings)
+			}
+			for _, p := range resolution.Projects {
+				if p.RoleConfirmedByManifest {
+					t.Errorf("%s confirmed by the root server.json, want none", p.Name)
+				}
+			}
+		})
+	}
+}
+
+// Several projects can share the manifest's directory; when its package
+// names none of them, it describes the one that is a server by its own
+// source, not whichever was discovered last.
+func TestApplyRegistryManifestSignals_SharedDirectoryDescribesItsServer(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "server.json"), `{"name": "io.example/my-mcp", "packages": [{"registryType": "oci", "identifier": "ghcr.io/example/my-mcp"}]}`)
+	server := &Project{Name: "my-mcp", Dir: root, RelDir: ".", Ecosystem: "node", Role: RoleMCPServer}
+	tools := &Project{Name: "my-mcp-tools", Dir: root, RelDir: ".", Ecosystem: "python", Role: RoleUnrelated}
+
+	if _, err := applyRegistryManifestSignals(root, []*Project{server, tools}); err != nil {
+		t.Fatal(err)
+	}
+	if !server.RoleConfirmedByManifest || tools.Role != RoleUnrelated {
+		t.Errorf("server confirmed = %v, tools role = %v; want the Node server confirmed and the Python tools untouched", server.RoleConfirmedByManifest, tools.Role)
 	}
 }

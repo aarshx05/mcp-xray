@@ -81,3 +81,94 @@ func TestDiscoverProjects_FindsNestedProjects(t *testing.T) {
 		t.Fatalf("expected 2 projects (parent + nested), got %d: %+v", len(projects), projects)
 	}
 }
+
+func TestReadFileCapped(t *testing.T) {
+	dir := t.TempDir()
+	small := filepath.Join(dir, "package.json")
+	writeFile(t, small, `{"name": "x"}`)
+	oversized := filepath.Join(dir, "server.py")
+	writeFile(t, oversized, "from fastmcp import FastMCP\n")
+	if err := os.Truncate(oversized, maxReadFileSize+1); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(small, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	device := filepath.Join(dir, "device.ts")
+	if err := os.Symlink("/dev/zero", device); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name, path string
+		ok         bool
+	}{
+		{"regular file", small, true},
+		{"symlink to a regular file", link, true},
+		{"directory", dir, false},
+		{"file over the size cap", oversized, false},
+		{"symlink to a device", device, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, statErr := os.Stat(tc.path); statErr != nil && tc.path == device {
+				t.Skip("/dev/zero unavailable")
+			}
+			data, err := readFileCapped(tc.path)
+			if (err == nil) != tc.ok {
+				t.Fatalf("readFileCapped(%s) error = %v, want ok=%v", tc.name, err, tc.ok)
+			}
+			if tc.ok && string(data) != `{"name": "x"}` {
+				t.Errorf("readFileCapped(%s) = %q", tc.name, data)
+			}
+		})
+	}
+}
+
+// The walk visits regular files only, as the scanners do: a symlink among a
+// project's sources, here to a server outside the repository, is never read
+// as evidence of what the project is, and neither is a source file larger
+// than the scanners read.
+func TestResolve_SymlinkedAndOversizedSourcesAreNotEvidence(t *testing.T) {
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "server.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "linked", "package.json"), `{"name": "linked", "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+	if err := os.Symlink(filepath.Join(outside, "server.ts"), filepath.Join(root, "linked", "index.ts")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	script := filepath.Join(root, "scripts", "server.py")
+	writeFile(t, script, "from fastmcp import FastMCP\nmcp = FastMCP(\"x\")\nif __name__ == \"__main__\":\n    mcp.run()\n")
+	if err := os.Truncate(script, maxReadFileSize+1); err != nil {
+		t.Fatal(err)
+	}
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if len(resolution.Targets) != 0 {
+		t.Errorf("targets = %v, want none", targetNames(resolution.Targets))
+	}
+}
+
+// npm and the other tools reading these manifests skip a leading UTF-8 byte
+// order mark, so a package.json, server.json or mcp.json saved with one is
+// still the manifest it looks like.
+func TestJSONManifestsWithByteOrderMark(t *testing.T) {
+	dir := t.TempDir()
+	const bom = "\xef\xbb\xbf"
+	writeFile(t, filepath.Join(dir, "package.json"), bom+`{"name": "my-mcp"}`)
+	writeFile(t, filepath.Join(dir, "server.json"), bom+validServerJSON)
+	writeFile(t, filepath.Join(dir, "mcp.json"), bom+`{"mcpServers": {}}`)
+
+	if p, err := newNodeProject(filepath.Join(dir, "package.json")); err != nil || p.PackageName != "my-mcp" {
+		t.Errorf("newNodeProject = %+v, %v; want the my-mcp package", p, err)
+	}
+	if _, ok := readRegistryManifest(dir, filepath.Join(dir, "server.json")); !ok {
+		t.Error("readRegistryManifest rejected a manifest with a byte order mark")
+	}
+	if !hasConsumerConfig(&Project{Dir: dir}) {
+		t.Error("hasConsumerConfig missed an mcp.json with a byte order mark")
+	}
+}

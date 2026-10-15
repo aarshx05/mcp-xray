@@ -2,6 +2,7 @@ package targetresolve
 
 import (
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -55,7 +56,7 @@ shared-lib = { path = "../shared", develop = true }
 	if err != nil {
 		t.Fatalf("newPythonProject(shared) error: %v", err)
 	}
-	resolvePythonLocalDeps([]*Project{server, shared})
+	resolvePythonLocalDeps(root, []*Project{server, shared})
 
 	if len(server.LocalDeps) != 1 || server.LocalDeps[0] != shared.Dir {
 		t.Errorf("expected server.LocalDeps == [%q], got %v", shared.Dir, server.LocalDeps)
@@ -81,7 +82,7 @@ shared-lib = { path = "../shared" }
 
 	server, _ := newPythonProject(filepath.Join(serverDir, "pyproject.toml"))
 	shared, _ := newPythonProject(filepath.Join(sharedDir, "pyproject.toml"))
-	resolvePythonLocalDeps([]*Project{server, shared})
+	resolvePythonLocalDeps(root, []*Project{server, shared})
 
 	if len(server.LocalDeps) != 1 || server.LocalDeps[0] != shared.Dir {
 		t.Errorf("expected server.LocalDeps == [%q], got %v", shared.Dir, server.LocalDeps)
@@ -104,7 +105,7 @@ shared-lib = { workspace = true }
 
 	server, _ := newPythonProject(filepath.Join(serverDir, "pyproject.toml"))
 	shared, _ := newPythonProject(filepath.Join(sharedDir, "pyproject.toml"))
-	resolvePythonLocalDeps([]*Project{server, shared})
+	resolvePythonLocalDeps(root, []*Project{server, shared})
 
 	if len(server.LocalDeps) != 1 || server.LocalDeps[0] != shared.Dir {
 		t.Errorf("expected server.LocalDeps == [%q] via workspace=true name match, got %v", shared.Dir, server.LocalDeps)
@@ -138,7 +139,7 @@ examples = { workspace = true }
 		projects = append(projects, p)
 	}
 
-	resolvePythonLocalDeps(projects)
+	resolvePythonLocalDeps(root, projects)
 
 	sdk := projects[0]
 	if len(sdk.LocalDeps) != 2 {
@@ -174,7 +175,7 @@ fixtures = { path = "fixtures" }
 		projects = append(projects, p)
 	}
 
-	resolvePythonLocalDeps(projects)
+	resolvePythonLocalDeps(root, projects)
 
 	app := projects[0]
 	if len(app.LocalDeps) != 2 {
@@ -182,5 +183,82 @@ fixtures = { path = "fixtures" }
 	}
 	if len(app.DevLocalDeps) != 1 || app.DevLocalDeps[0] != filepath.Join(root, "fixtures") {
 		t.Errorf("DevLocalDeps = %v, want only fixtures", app.DevLocalDeps)
+	}
+}
+
+// A pyproject.toml declaring no project name (tool settings only) is no
+// package a workspace source can name, whatever its directory is called.
+func TestResolvePythonLocalDeps_UnnamedProjectIsNotADependency(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "server", "pyproject.toml"), `[project]
+name = "server"
+dependencies = ["tools"]
+
+[tool.uv.sources]
+tools = { workspace = true }
+`)
+	writeFile(t, filepath.Join(root, "tools", "pyproject.toml"), "[tool.ruff]\nline-length = 100\n")
+
+	server, _ := newPythonProject(filepath.Join(root, "server", "pyproject.toml"))
+	tools, _ := newPythonProject(filepath.Join(root, "tools", "pyproject.toml"))
+	resolvePythonLocalDeps(root, []*Project{server, tools})
+
+	if len(server.LocalDeps) != 0 {
+		t.Errorf("server.LocalDeps = %v, want none", server.LocalDeps)
+	}
+}
+
+// As uv does, a workspace member inherits the root's [tool.uv.sources] for
+// the dependencies it declares: the Python SDK's example servers depend on
+// "mcp", which the root's `mcp = { workspace = true }` makes the SDK in the
+// repository, and an inherited path is relative to the root. A member's own
+// source for a name wins, a name it does not declare is not inherited, and
+// a project the members globs leave out inherits nothing.
+func TestResolvePythonLocalDeps_InheritsUvWorkspaceRootSources(t *testing.T) {
+	root := t.TempDir()
+	manifests := map[string]string{
+		".": `[project]
+name = "mcp"
+dependencies = ["mcp-types"]
+
+[tool.uv.workspace]
+members = ["src/mcp-types", "examples/servers/*"]
+
+[tool.uv.sources]
+mcp = { workspace = true }
+mcp-types = { workspace = true }
+helpers = { path = "libs/helpers" }
+`,
+		"src/mcp-types":            "[project]\nname = \"mcp-types\"\n",
+		"libs/helpers":             "[project]\nname = \"helpers\"\n",
+		"vendor/mcp":               "[project]\nname = \"mcp-fork\"\n",
+		"examples/servers/weather": "[project]\nname = \"weather\"\ndependencies = [\"mcp\"]\n\n[dependency-groups]\ndev = [\"helpers\"]\n",
+		"examples/servers/pinned":  "[project]\nname = \"pinned\"\ndependencies = [\"mcp\"]\n\n[tool.uv.sources]\nmcp = { path = \"../../../vendor/mcp\" }\n",
+		"tools/outside":            "[project]\nname = \"outside\"\ndependencies = [\"mcp\"]\n",
+	}
+	projects := map[string]*Project{}
+	var all []*Project
+	for dir, manifest := range manifests {
+		writeFile(t, filepath.Join(root, dir, "pyproject.toml"), manifest)
+		p, err := newPythonProject(filepath.Join(root, dir, "pyproject.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		projects[dir], all = p, append(all, p)
+	}
+
+	resolvePythonLocalDeps(root, all)
+
+	for dir, want := range map[string][]string{
+		"examples/servers/weather": {root, filepath.Join(root, "libs", "helpers")},
+		"examples/servers/pinned":  {filepath.Join(root, "vendor", "mcp")},
+		"tools/outside":            nil,
+	} {
+		if got := projects[dir].LocalDeps; !slices.Equal(got, want) {
+			t.Errorf("%s LocalDeps = %v, want %v", dir, got, want)
+		}
+	}
+	if weather := projects["examples/servers/weather"]; !slices.Equal(weather.DevLocalDeps, []string{filepath.Join(root, "libs", "helpers")}) {
+		t.Errorf("weather DevLocalDeps = %v, want only helpers, a dependency group's", weather.DevLocalDeps)
 	}
 }

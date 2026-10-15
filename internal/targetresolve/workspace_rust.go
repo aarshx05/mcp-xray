@@ -1,7 +1,6 @@
 package targetresolve
 
 import (
-	"os"
 	"path/filepath"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -15,7 +14,7 @@ import (
 // style workspace_python.go already uses for pyproject.toml, for the same
 // reason.
 func readCargoToml(manifestPath string) (map[string]interface{}, error) {
-	data, err := os.ReadFile(manifestPath)
+	data, err := readFileCapped(manifestPath)
 	if err != nil {
 		return nil, err
 	}

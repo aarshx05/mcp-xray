@@ -2,7 +2,6 @@ package targetresolve
 
 import (
 	"encoding/xml"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -32,7 +31,7 @@ type csprojRef struct {
 
 // readCsproj centralizes the read+parse boilerplate, mirroring readGoMod.
 func readCsproj(manifestPath string) (*csprojFile, error) {
-	data, err := os.ReadFile(manifestPath)
+	data, err := readFileCapped(manifestPath)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +77,9 @@ func dotnetPackageReferencePrefix(doc *csprojFile, prefix string) bool {
 //
 //  1. MSBuild property expansion. $(RepoRoot) is a common convention
 //     (defined once, at the repo root, in Directory.Build.props as
-//     $(MSBuildThisFileDirectory)) -- substituted with repoRoot here. Any
+//     $(MSBuildThisFileDirectory), which ends in a separator, so
+//     "$(RepoRoot)core\X\X.csproj" is the usual spelling) -- substituted
+//     with repoRoot and a trailing separator here. Any
 //     *other* unresolved $(...) token left in a path means "cannot resolve
 //     this reference," and it is skipped rather than guessed at, the same
 //     conservative posture isLocalFilesystemPath already uses for Go.
@@ -117,12 +118,12 @@ func resolveDotnetLocalDeps(repoRoot string, projects []*Project) {
 // false if a different, unhandled $(...) property remains, signaling the
 // caller should give up on this reference rather than guess.
 func expandMSBuildPath(raw string, repoRoot string) (string, bool) {
-	expanded := msbuildRepoRoot.ReplaceAllLiteralString(raw, filepath.ToSlash(repoRoot))
+	expanded := msbuildRepoRoot.ReplaceAllLiteralString(raw, filepath.ToSlash(repoRoot)+"/")
 	if strings.Contains(expanded, "$(") {
 		return "", false
 	}
 	expanded = strings.ReplaceAll(expanded, "\\", "/")
-	return filepath.FromSlash(expanded), true
+	return filepath.Clean(filepath.FromSlash(expanded)), true
 }
 
 func resolveDotnetProjectReference(p *Project, rawInclude string, repoRoot string, byDir map[string]*Project) {

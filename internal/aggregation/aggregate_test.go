@@ -149,7 +149,9 @@ func TestContextForPath_FileNamesAreNotDirectoryTags(t *testing.T) {
 		{"build", "production"},
 		{"cmd/build", "production"},
 		{"pkg/vendor.go", "production"},
-		{"tools/test.go", "build"},
+		// tools/ is where MCP servers keep their tool handlers.
+		{"tools/test.go", "production"},
+		{"tools/Azure.Mcp.Tools.Storage/src/StorageService.cs", "production"},
 		{"internal/test/helpers.go", "test"},
 		{"docs/index.md", "docs"},
 		{"README.md", "docs"},
@@ -167,6 +169,43 @@ func TestContextForPath_FileNamesAreNotDirectoryTags(t *testing.T) {
 		{"vendor/github.com/x/testing/y.go", "vendored"},
 		{"scripts/docs/build.sh", "build"},
 		{"examples/tests/demo.py", "example"},
+	}
+	for _, tc := range cases {
+		if got := ContextForPath(tc.path); got != tc.want {
+			t.Errorf("ContextForPath(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// A markup document is docs wherever it is; a file in no tagged directory is
+// a test when its name follows its language's test convention; a directory
+// is tagged only by its conventional lower-case name.
+func TestContextForPath_DocumentsTestFilesAndNamespaces(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"src/server/SKILL.md", "docs"},
+		{"packages/core/guide.mdx", "docs"},
+		{"tests/README.md", "docs"},
+		{"requirements.txt", "production"},
+		{"src/handler_test.go", "test"},
+		{"src/auth/token-cache.test.ts", "test"},
+		{"src/sentry.spec.ts", "test"},
+		{"pkg/test_server.py", "test"},
+		{"pkg/server_test.py", "test"},
+		{"pkg/conftest.py", "test"},
+		{"src/latest.ts", "production"},
+		{"src/contest.py", "production"},
+		{"src/spec.ts", "production"},
+		{"examples/demo_test.go", "example"},
+		{"tools/Azure.Mcp.Tools.Foo/tests/Azure.Mcp.Tools.Foo.Tests/FooTests.cs", "test"},
+		{"src/Foo.UnitTests/BarTests.cs", "test"},
+		{"src/Options/Docs/DocsGetOptions.cs", "production"},
+		{"src/Webapp/Deployment/DeploymentGetCommand.cs", "production"},
+		{"src/e2e/flow.ts", "test"},
+		{"eng/common/scripts/x.ps1", "build"},
+		{"docs_src/tutorial/server.py", "docs"},
 	}
 	for _, tc := range cases {
 		if got := ContextForPath(tc.path); got != tc.want {

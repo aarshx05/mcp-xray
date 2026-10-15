@@ -262,3 +262,20 @@ func TestNewNodeProject_NonStringScriptValues(t *testing.T) {
 		t.Errorf("newNodeProject = %+v, %v; want the server project", p, err)
 	}
 }
+
+// A package.json without a "name" is no package a dependency can name,
+// whatever its directory is called: the server's registry dependency on
+// hono is not the unnamed examples/hono app.
+func TestResolveNodeLocalDeps_UnnamedPackageIsNotADependency(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "server", "package.json"), `{"name": "my-mcp", "dependencies": {"hono": "^4.0.0"}}`)
+	writeFile(t, filepath.Join(root, "examples", "hono", "package.json"), `{"private": true, "dependencies": {"hono": "^4.0.0"}}`)
+
+	server, _ := newNodeProject(filepath.Join(root, "server", "package.json"))
+	example, _ := newNodeProject(filepath.Join(root, "examples", "hono", "package.json"))
+	resolveNodeLocalDeps([]*Project{server, example})
+
+	if len(server.LocalDeps) != 0 {
+		t.Errorf("server.LocalDeps = %v, want none", server.LocalDeps)
+	}
+}

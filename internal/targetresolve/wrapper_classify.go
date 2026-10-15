@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -17,22 +17,21 @@ import (
 // hasOwnEntrypointEvidence reports whether p has independent proof of being
 // a launchable entrypoint in its own right, as opposed to being reachable
 // merely as a downstream dependency of something else: a declared
-// entrypoint (hasDeclaredEntrypoint) or a source-level startup-call signal
-// (wrapperEntrypointPatterns, signals.go) found in its own directory.
+// entrypoint (hasDeclaredEntrypoint) or a source-level startup signal
+// (every one of its ecosystem's wrapperEntrypointPatterns, signals.go) found
+// in its own source.
 func hasOwnEntrypointEvidence(p *Project, allProjects []*Project) bool {
 	if hasDeclaredEntrypoint(p) {
 		return true
 	}
-	pattern, ok := wrapperEntrypointPatterns[p.Ecosystem]
-	if !ok {
+	patterns := make(map[string]*regexp.Regexp)
+	for i, pattern := range wrapperEntrypointPatterns[p.Ecosystem] {
+		patterns[strconv.Itoa(i)] = pattern
+	}
+	if len(patterns) == 0 {
 		return false
 	}
-	exts, ok := ecosystemSourceExtensions[p.Ecosystem]
-	if !ok {
-		return false
-	}
-	signals := projectSourceSignals(p, allProjects, exts, map[string]*regexp.Regexp{"entrypoint": pattern})
-	return signals["entrypoint"]
+	return len(projectSourceSignals(p, allProjects, ecosystemSourceExtensions[p.Ecosystem], patterns)) == len(patterns)
 }
 
 // runtimeClosure returns the projects p reaches through the workspace-local
@@ -40,7 +39,7 @@ func hasOwnEntrypointEvidence(p *Project, allProjects []*Project) bool {
 // recorded in DevLocalDeps (Python dependency groups): a project that pulls
 // in a server only to test against it does not wrap it. Node
 // devDependencies are followed, since a bundled CLI ships them.
-func runtimeClosure(p *Project, byDir map[string]*Project) []*Project {
+func runtimeClosure(p *Project, dirs projectDirs) []*Project {
 	visited := map[*Project]bool{p: true}
 	order := []*Project{p}
 	for i := 0; i < len(order); i++ {
@@ -49,7 +48,7 @@ func runtimeClosure(p *Project, byDir map[string]*Project) []*Project {
 			if slices.Contains(current.DevLocalDeps, dir) {
 				continue
 			}
-			if dep := byDir[filepath.Clean(dir)]; dep != nil && !visited[dep] {
+			if dep := dirs.dep(current, dir); dep != nil && !visited[dep] {
 				visited[dep] = true
 				order = append(order, dep)
 			}
@@ -122,14 +121,8 @@ var nodePackageRunners = map[string]bool{"npx": true, "bunx": true, "pnpm": true
 // file a server is launched from, not a client's, a build entry's or a
 // nested project's.
 func nodeScriptStartsServer(p *Project, allProjects []*Project) bool {
-	data, err := os.ReadFile(p.ManifestPath)
+	manifest, err := readPackageJSON(p.ManifestPath)
 	if err != nil {
-		return false
-	}
-	var manifest struct {
-		Scripts map[string]json.RawMessage `json:"scripts"`
-	}
-	if json.Unmarshal(data, &manifest) != nil {
 		return false
 	}
 	for _, raw := range manifest.Scripts {
@@ -139,11 +132,11 @@ func nodeScriptStartsServer(p *Project, allProjects []*Project) bool {
 		}
 		for _, file := range scriptRunFiles(script) {
 			path := filepath.Join(p.Dir, filepath.FromSlash(file))
-			if !within(path, p.Dir) || insideNestedProject(path, p.ScanRoot(), projectScanRoots(allProjects)) {
+			if !within(path, p.Dir) || isTestSource(p.Dir, path) || insideNestedProject(path, p.ScanRoot(), nestedProjectRoots(allProjects)) {
 				continue
 			}
-			source, err := os.ReadFile(path)
-			if err == nil && wrapperEntrypointPatterns["node"].Match(source) && nodeServerPattern.Match(source) {
+			source, err := readFileCapped(path)
+			if err == nil && nodeEntrypointPattern.Match(source) && nodeServerPattern.Match(source) {
 				return true
 			}
 		}
@@ -151,10 +144,14 @@ func nodeScriptStartsServer(p *Project, allProjects []*Project) bool {
 	return false
 }
 
-func projectScanRoots(projects []*Project) []string {
+// nestedProjectRoots returns the scan roots of the projects that bound the
+// source of a project enclosing them (ownsDirectory).
+func nestedProjectRoots(projects []*Project) []string {
 	roots := make([]string, 0, len(projects))
 	for _, project := range projects {
-		roots = append(roots, project.ScanRoot())
+		if ownsDirectory(project) {
+			roots = append(roots, project.ScanRoot())
+		}
 	}
 	return roots
 }
@@ -164,7 +161,7 @@ func projectScanRoots(projects []*Project) []string {
 // the platform runs, the way a bin entry names a command.
 func hasWorkerEntrypoint(p *Project) bool {
 	for _, name := range []string{"wrangler.toml", "wrangler.json", "wrangler.jsonc"} {
-		data, err := os.ReadFile(filepath.Join(p.Dir, name))
+		data, err := readFileCapped(filepath.Join(p.Dir, name))
 		if err != nil {
 			continue
 		}
@@ -198,7 +195,7 @@ func declaresWorkerMain(config map[string]interface{}) bool {
 // jsoncToJSON removes the byte order mark, comments and trailing commas
 // JSONC allows, leaving string contents untouched.
 func jsoncToJSON(data []byte) []byte {
-	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
+	data = bytes.TrimPrefix(data, utf8BOM)
 	var uncommented []byte
 	for i := 0; i < len(data); i++ {
 		switch {
@@ -287,10 +284,7 @@ func hasOwnClientCode(p *Project, allProjects []*Project) bool {
 // multi-hop wrapper chain (a wrapper of a wrapper) is fully resolved, not
 // just one hop.
 func promoteWrapperServers(projects []*Project) {
-	byDir := make(map[string]*Project, len(projects))
-	for _, p := range projects {
-		byDir[filepath.Clean(p.Dir)] = p
-	}
+	dirs := indexProjectDirs(projects)
 
 	for iterations := 0; iterations < len(projects); iterations++ {
 		changed := false
@@ -310,7 +304,7 @@ func promoteWrapperServers(projects []*Project) {
 			if p.Role == RoleMCPClient && !hasWorkerEntrypoint(p) && hasOwnClientCode(p, projects) {
 				continue
 			}
-			for _, dep := range runtimeClosure(p, byDir) {
+			for _, dep := range runtimeClosure(p, dirs) {
 				if dep != p && dep.Role == RoleMCPServer {
 					p.Role = RoleMCPServer
 					p.Evidence = append(p.Evidence, fmt.Sprintf(

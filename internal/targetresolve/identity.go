@@ -49,10 +49,7 @@ func projectRepoRoot(p *Project) (root string, ok bool) {
 // converts dependency edges to the stable-ID representation. It is called
 // only after all discovery and registry promotion is complete.
 func assignIdentities(repoRoot string, projects []*Project) []*Component {
-	byDir := make(map[string][]*Project, len(projects))
-	for _, p := range projects {
-		byDir[filepath.Clean(p.Dir)] = append(byDir[filepath.Clean(p.Dir)], p)
-	}
+	dirs := indexProjectDirs(projects)
 
 	for _, p := range projects {
 		identityPath := p.ManifestPath
@@ -67,13 +64,11 @@ func assignIdentities(repoRoot string, projects []*Project) []*Component {
 	}
 
 	// Edges are converted only once EVERY project has its ID: a dependency
-	// later in the slice would otherwise contribute an empty ID, and
-	// transitiveClosure, which trusts LocalDepIDs whenever any of them
-	// resolves, would silently drop that dependency from the target's scope.
+	// later in the slice would otherwise contribute an empty ID.
 	for _, p := range projects {
 		p.LocalDepIDs = p.LocalDepIDs[:0]
 		for _, depDir := range p.LocalDeps {
-			for _, dep := range byDir[filepath.Clean(depDir)] {
+			if dep := dirs.dep(p, depDir); dep != nil {
 				p.LocalDepIDs = append(p.LocalDepIDs, dep.ID)
 			}
 		}
@@ -123,7 +118,7 @@ func assignIdentities(repoRoot string, projects []*Project) []*Component {
 func inferOwnershipRoot(repoRoot string, p *Project, projects []*Project) (string, []string, bool) {
 	start := filepath.Clean(p.Dir)
 	for dir := start; ; dir = filepath.Dir(dir) {
-		if isOwnershipBoundary(dir, projects) {
+		if isOwnershipBoundary(repoRoot, dir, projects) {
 			return dir, []string{fmt.Sprintf("ownership boundary discovered at %s", repoRelative(repoRoot, dir))}, false
 		}
 		if dir == filepath.Clean(repoRoot) || dir == filepath.Dir(dir) {

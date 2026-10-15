@@ -25,6 +25,23 @@ func TestNewGoProject(t *testing.T) {
 	}
 }
 
+func TestNewGoProject_MajorVersionSuffixIsNotTheName(t *testing.T) {
+	for modulePath, want := range map[string]string{
+		"github.com/acme/weather-mcp/v2": "weather-mcp",
+		"gopkg.in/acme/weather.v3":       "weather",
+	} {
+		manifest := filepath.Join(t.TempDir(), "go.mod")
+		writeFile(t, manifest, "module "+modulePath+"\n\ngo 1.22\n")
+		p, err := newGoProject(manifest)
+		if err != nil {
+			t.Fatalf("newGoProject(%s) returned error: %v", modulePath, err)
+		}
+		if p.Name != want {
+			t.Errorf("newGoProject(%s).Name = %q, want %q", modulePath, p.Name, want)
+		}
+	}
+}
+
 func TestResolveGoLocalDeps_ReplaceDirective(t *testing.T) {
 	root := t.TempDir()
 	serverDir := filepath.Join(root, "server")

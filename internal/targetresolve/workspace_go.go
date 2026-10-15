@@ -1,12 +1,12 @@
 package targetresolve
 
 import (
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
 
 // readGoMod centralizes the read+parse boilerplate that every pass over a
@@ -14,14 +14,16 @@ import (
 // detection), so those three passes stay small and consistent rather than
 // each re-implementing the same few lines.
 func readGoMod(manifestPath string) (*modfile.File, error) {
-	data, err := os.ReadFile(manifestPath)
+	data, err := readFileCapped(manifestPath)
 	if err != nil {
 		return nil, err
 	}
 	return modfile.Parse(manifestPath, data, nil)
 }
 
-// newGoProject builds a Project from a discovered go.mod file.
+// newGoProject builds a Project from a discovered go.mod file, named by
+// the last element of its module path without the major version suffix:
+// github.com/acme/weather-mcp/v2 is weather-mcp, not v2.
 func newGoProject(manifestPath string) (*Project, error) {
 	mf, err := readGoMod(manifestPath)
 	if err != nil {
@@ -31,7 +33,8 @@ func newGoProject(manifestPath string) (*Project, error) {
 	dir := filepath.Dir(manifestPath)
 	name := filepath.Base(dir)
 	if mf.Module != nil && mf.Module.Mod.Path != "" {
-		name = lastPathSegment(mf.Module.Mod.Path)
+		prefix, _, _ := module.SplitPathVersion(mf.Module.Mod.Path)
+		name = lastPathSegment(prefix)
 	}
 
 	return &Project{

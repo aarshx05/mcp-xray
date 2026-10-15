@@ -23,12 +23,9 @@ import (
 // correct rather than special-cased away, since excluding it could just as
 // easily discard a real, needed dependency.
 func buildTargets(projects []*Project) []*Target {
-	byDir := make(map[string]*Project, len(projects))
-	for _, p := range projects {
-		byDir[filepath.Clean(p.Dir)] = p
-	}
+	dirs := indexProjectDirs(projects)
 
-	demoteReachableFallbackServers(projects, byDir)
+	demoteReachableFallbackServers(projects, dirs)
 
 	var targets []*Target
 	for _, p := range projects {
@@ -36,7 +33,7 @@ func buildTargets(projects []*Project) []*Target {
 			continue
 		}
 
-		included := transitiveClosure(p, byDir)
+		included := transitiveClosure(p, dirs)
 		includedSet := make(map[*Project]bool, len(included))
 		reasons := make(map[string]InclusionReason, len(included))
 		for _, dep := range included {
@@ -58,7 +55,7 @@ func buildTargets(projects []*Project) []*Target {
 			reasons[filepath.Clean(dep.Dir)] = InclusionSharedDependency
 		}
 
-		testDependents := includeTestDependents(p, includedSet, projects, byDir)
+		testDependents := includeTestDependents(p, includedSet, projects, dirs)
 		for _, dep := range testDependents {
 			evCopy := make([]string, len(dep.Evidence), len(dep.Evidence)+1)
 			copy(evCopy, dep.Evidence)
@@ -95,14 +92,14 @@ func buildTargets(projects []*Project) []*Target {
 // fixed-point loop): whether a project is test-shaped never changes, and
 // "does candidate's closure reach primary" is purely graph-topological --
 // neither depends on what this function has added so far.
-func includeTestDependents(primary *Project, alreadyIncluded map[*Project]bool, allProjects []*Project, byDir map[string]*Project) []*Project {
+func includeTestDependents(primary *Project, alreadyIncluded map[*Project]bool, allProjects []*Project, dirs projectDirs) []*Project {
 	var added []*Project
 	for _, candidate := range allProjects {
 		if alreadyIncluded[candidate] || !isTestShapedProject(candidate) {
 			continue
 		}
 
-		closure := transitiveClosure(candidate, byDir)
+		closure := transitiveClosure(candidate, dirs)
 		reachesPrimary := false
 		for _, reached := range closure {
 			if reached == primary {
@@ -125,34 +122,43 @@ func includeTestDependents(primary *Project, alreadyIncluded map[*Project]bool, 
 }
 
 // demoteReachableFallbackServers demotes to RoleSharedLibrary a project that
-// is a server by source signal alone but that another server depends on: a
-// shared "core" library can hold a repository's only SDK construction call
-// when every server calls a wrapper around it, which makes it look like a
-// server.
+// is a server by source signal alone but that another server needs to run:
+// a shared "core" library can hold a repository's only SDK construction
+// call when every server calls a wrapper around it, which makes it look
+// like a server. Only the dependencies a server runs with count
+// (runtimeClosure): one pulled in for its tests is not its library. Nor is
+// a server it is itself needed by: in a dependency cycle neither side is
+// the other's library.
 //
 // Two kinds of server are never demoted: one confirmed by its own
 // server.json (RoleConfirmedByManifest), and a launchable program
 // (isLaunchable), which is a standalone server even when another server
 // also depends on it -- @twilio-alpha/mcp depends on
 // @twilio-alpha/openapi-mcp-server, which has a bin entry of its own.
-func demoteReachableFallbackServers(projects []*Project, byDir map[string]*Project) {
-	reachableFromAnotherServer := make(map[*Project]bool)
-
+func demoteReachableFallbackServers(projects []*Project, dirs projectDirs) {
+	reaches := make(map[*Project]map[*Project]bool)
 	for _, root := range projects {
 		if root.Role != RoleMCPServer {
 			continue
 		}
-		for _, reached := range transitiveClosure(root, byDir) {
-			if reached != root {
-				reachableFromAnotherServer[reached] = true
+		reaches[root] = make(map[*Project]bool)
+		for _, reached := range runtimeClosure(root, dirs) {
+			reaches[root][reached] = true
+		}
+	}
+	reachedByAnotherServer := func(p *Project) bool {
+		for root, reached := range reaches {
+			if root != p && reached[p] && !reaches[p][root] {
+				return true
 			}
 		}
+		return false
 	}
 
 	for _, p := range projects {
 		if p.Role == RoleMCPServer &&
 			!p.RoleConfirmedByManifest &&
-			reachableFromAnotherServer[p] &&
+			reachedByAnotherServer(p) &&
 			!isLaunchable(p, projects) {
 			p.Role = RoleSharedLibrary
 		}
@@ -237,13 +243,7 @@ func mergeTargetsByComponent(targets []*Target) []*Target {
 // transitiveClosure returns p plus every project reachable from p by
 // following LocalDeps edges. Cycle-safe: a dependency cycle simply stops
 // expanding once every reachable project has been visited once.
-func transitiveClosure(p *Project, byDir map[string]*Project) []*Project {
-	byID := make(map[string]*Project, len(byDir))
-	for _, project := range byDir {
-		if project.ID != "" {
-			byID[project.ID] = project
-		}
-	}
+func transitiveClosure(p *Project, dirs projectDirs) []*Project {
 	visited := make(map[*Project]bool)
 	var order []*Project
 
@@ -254,24 +254,45 @@ func transitiveClosure(p *Project, byDir map[string]*Project) []*Project {
 		}
 		visited[cur] = true
 		order = append(order, cur)
-		usedStableEdge := false
-		if len(cur.LocalDepIDs) > 0 {
-			for _, depID := range cur.LocalDepIDs {
-				if dep := byID[depID]; dep != nil {
-					usedStableEdge = true
-					visit(dep)
-				}
-			}
-		}
-		if !usedStableEdge {
-			for _, depDir := range cur.LocalDeps {
-				if dep := byDir[filepath.Clean(depDir)]; dep != nil {
-					visit(dep)
-				}
+		for _, depDir := range cur.LocalDeps {
+			if dep := dirs.dep(cur, depDir); dep != nil {
+				visit(dep)
 			}
 		}
 	}
 	visit(p)
 
 	return order
+}
+
+// projectDirs indexes projects by directory, which is how LocalDeps names
+// them. Several projects can share a directory (a package.json beside a
+// pyproject.toml), so it holds every one of them.
+type projectDirs map[string][]*Project
+
+func indexProjectDirs(projects []*Project) projectDirs {
+	dirs := make(projectDirs, len(projects))
+	for _, p := range projects {
+		dir := filepath.Clean(p.Dir)
+		dirs[dir] = append(dirs[dir], p)
+	}
+	return dirs
+}
+
+// dep returns the project that p's LocalDeps entry dir refers to: the one
+// project in dir, or, when several share it, the one of p's own ecosystem,
+// since every workspace resolver links a project only to projects of its
+// own ecosystem (a file: dependency names a package.json, a Poetry path
+// dependency a pyproject.toml). nil when there is none.
+func (dirs projectDirs) dep(p *Project, dir string) *Project {
+	candidates := dirs[filepath.Clean(dir)]
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+	for _, candidate := range candidates {
+		if candidate.Ecosystem == p.Ecosystem {
+			return candidate
+		}
+	}
+	return nil
 }

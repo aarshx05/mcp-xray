@@ -12,13 +12,9 @@ func TestTransitiveClosure(t *testing.T) {
 	a.LocalDeps = []string{b.Dir}
 	b.LocalDeps = []string{c.Dir}
 
-	byDir := map[string]*Project{
-		filepath.Clean(a.Dir): a,
-		filepath.Clean(b.Dir): b,
-		filepath.Clean(c.Dir): c,
-	}
+	dirs := indexProjectDirs([]*Project{a, b, c})
 
-	closure := transitiveClosure(a, byDir)
+	closure := transitiveClosure(a, dirs)
 	if len(closure) != 3 {
 		t.Fatalf("expected closure of 3 (a, b, c), got %d: %+v", len(closure), closure)
 	}
@@ -30,12 +26,9 @@ func TestTransitiveClosure_CycleSafe(t *testing.T) {
 	a.LocalDeps = []string{b.Dir}
 	b.LocalDeps = []string{a.Dir} // cycle back to a
 
-	byDir := map[string]*Project{
-		filepath.Clean(a.Dir): a,
-		filepath.Clean(b.Dir): b,
-	}
+	dirs := indexProjectDirs([]*Project{a, b})
 
-	closure := transitiveClosure(a, byDir)
+	closure := transitiveClosure(a, dirs)
 	if len(closure) != 2 {
 		t.Fatalf("expected cycle-safe closure of 2, got %d: %+v", len(closure), closure)
 	}
@@ -199,12 +192,9 @@ func TestIncludeTestDependents_PullsInReverseDependentTestProject(t *testing.T) 
 	testProj := &Project{Name: "server-tests", Dir: "/repo/tests/server.tests", RelDir: "tests/server.tests"}
 	testProj.LocalDeps = []string{primary.Dir}
 
-	byDir := map[string]*Project{
-		filepath.Clean(primary.Dir):  primary,
-		filepath.Clean(testProj.Dir): testProj,
-	}
+	dirs := indexProjectDirs([]*Project{primary, testProj})
 
-	added := includeTestDependents(primary, map[*Project]bool{primary: true}, []*Project{primary, testProj}, byDir)
+	added := includeTestDependents(primary, map[*Project]bool{primary: true}, []*Project{primary, testProj}, dirs)
 	if len(added) != 1 || added[0] != testProj {
 		t.Fatalf("expected testProj to be pulled in via its reverse dependency on primary, got %+v", added)
 	}
@@ -220,12 +210,9 @@ func TestIncludeTestDependents_NonTestShapedDependentIsNeverPulledIn(t *testing.
 	otherApp := &Project{Name: "other-app", Dir: "/repo/apps/other-app"}
 	otherApp.LocalDeps = []string{primary.Dir}
 
-	byDir := map[string]*Project{
-		filepath.Clean(primary.Dir):  primary,
-		filepath.Clean(otherApp.Dir): otherApp,
-	}
+	dirs := indexProjectDirs([]*Project{primary, otherApp})
 
-	added := includeTestDependents(primary, map[*Project]bool{primary: true}, []*Project{primary, otherApp}, byDir)
+	added := includeTestDependents(primary, map[*Project]bool{primary: true}, []*Project{primary, otherApp}, dirs)
 	if len(added) != 0 {
 		t.Fatalf("expected a non-test-shaped dependent to never be pulled in, got %+v", added)
 	}
@@ -245,15 +232,10 @@ func TestIncludeTestDependents_UnrelatedServersOwnTestsDoNotLeakViaSharedDep(t *
 	serverBTests := &Project{Name: "server-b-tests", Dir: "/repo/tests/server-b", RelDir: "tests/server-b"}
 	serverBTests.LocalDeps = []string{serverB.Dir}
 
-	byDir := map[string]*Project{
-		filepath.Clean(shared.Dir):       shared,
-		filepath.Clean(serverA.Dir):      serverA,
-		filepath.Clean(serverB.Dir):      serverB,
-		filepath.Clean(serverBTests.Dir): serverBTests,
-	}
+	dirs := indexProjectDirs([]*Project{shared, serverA, serverB, serverBTests})
 	allProjects := []*Project{shared, serverA, serverB, serverBTests}
 
-	addedForA := includeTestDependents(serverA, map[*Project]bool{serverA: true, shared: true}, allProjects, byDir)
+	addedForA := includeTestDependents(serverA, map[*Project]bool{serverA: true, shared: true}, allProjects, dirs)
 	if len(addedForA) != 0 {
 		t.Fatalf("expected server-b's own tests to never leak into server-a's target scope, got %+v", addedForA)
 	}
@@ -371,4 +353,36 @@ func TestDemoteReachableFallbackServers_LaunchableServersStay(t *testing.T) {
 	if scripted.Role != RoleMCPServer || python.Role != RoleMCPServer || len(targets) != 3 {
 		t.Errorf("roles = %v, %v; targets = %v; want all three servers kept", scripted.Role, python.Role, targetNames(targets))
 	}
+}
+
+// Demotion follows the dependencies a server runs with, and never runs both
+// ways: a server whose tests pull in another server (a Python dependency
+// group) is not that server's library, and two servers depending on each
+// other -- a core whose tests use the app built on it -- are neither the
+// other's library.
+func TestDemoteReachableFallbackServers_DevelopmentEdgesAndCycles(t *testing.T) {
+	t.Run("development dependency", func(t *testing.T) {
+		harness := &Project{Name: "harness", Dir: "/repo/harness", Ecosystem: "python", Role: RoleMCPServer}
+		weather := &Project{Name: "weather", Dir: "/repo/weather", Ecosystem: "python", Role: RoleMCPServer}
+		harness.LocalDeps = []string{weather.Dir}
+		harness.DevLocalDeps = []string{weather.Dir}
+
+		targets := buildTargets([]*Project{harness, weather})
+
+		if weather.Role != RoleMCPServer || len(targets) != 2 {
+			t.Errorf("weather role = %v, targets = %v; want both servers kept", weather.Role, targetNames(targets))
+		}
+	})
+	t.Run("cycle", func(t *testing.T) {
+		app := &Project{Name: "app", Dir: "/repo/packages/app", Ecosystem: "node", Role: RoleMCPServer}
+		core := &Project{Name: "core", Dir: "/repo/packages/core", Ecosystem: "node", Role: RoleMCPServer}
+		app.LocalDeps = []string{core.Dir}
+		core.LocalDeps = []string{app.Dir}
+
+		targets := buildTargets([]*Project{app, core})
+
+		if app.Role != RoleMCPServer || core.Role != RoleMCPServer || len(targets) != 2 {
+			t.Errorf("roles = %v, %v; targets = %v; want both servers kept", app.Role, core.Role, targetNames(targets))
+		}
+	})
 }

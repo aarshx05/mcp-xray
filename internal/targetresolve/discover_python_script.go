@@ -21,7 +21,7 @@ func discoverLegacyPythonScripts(repoRoot string) ([]*Project, error) {
 		if hasEnclosingPythonManifest(dir, repoRoot) {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		data, err := readFileCapped(path)
 		if err != nil || !legacyPythonScriptPrefilterPattern.Match(data) {
 			return nil
 		}
@@ -41,16 +41,16 @@ func discoverLegacyPythonScripts(repoRoot string) ([]*Project, error) {
 }
 
 // hasEnclosingPythonManifest walks UP from dir to repoRoot (inclusive)
-// checking each ancestor for pyproject.toml or setup.py -- independent of
-// what discoverProjects already found, so a setup.py-based legacy package
-// (out of scope for this feature) is also correctly excluded from this
-// manifest-less special case, and a .py file nested several directories
-// below a distant ancestor manifest is excluded too, not just an immediate
-// sibling.
+// checking each ancestor for a setup.py or a pyproject.toml that declares a
+// project (declaresPythonProject) -- independent of what discoverProjects
+// already found, so a setup.py-based legacy package (out of scope for this
+// feature) is also correctly excluded from this manifest-less special case,
+// and a .py file nested several directories below a distant ancestor
+// manifest is excluded too, not just an immediate sibling.
 func hasEnclosingPythonManifest(dir, repoRoot string) bool {
 	repoRoot = filepath.Clean(repoRoot)
 	for cur := filepath.Clean(dir); ; {
-		if fileExists(filepath.Join(cur, "pyproject.toml")) || fileExists(filepath.Join(cur, "setup.py")) {
+		if declaresPythonProject(filepath.Join(cur, "pyproject.toml")) || fileExists(filepath.Join(cur, "setup.py")) {
 			return true
 		}
 		if cur == repoRoot {
@@ -62,6 +62,20 @@ func hasEnclosingPythonManifest(dir, repoRoot string) bool {
 		}
 		cur = parent
 	}
+}
+
+// declaresPythonProject reports whether the pyproject.toml at path declares
+// a package ([project] or [tool.poetry]). One holding only tool settings,
+// such as a repository-wide [tool.ruff], packages nothing, so the scripts
+// below it are still standalone.
+func declaresPythonProject(path string) bool {
+	doc, err := readPyprojectToml(path)
+	if err != nil {
+		return false
+	}
+	_, isProject := mapAt(doc, "project")
+	_, isPoetry := mapAt(doc, "tool", "poetry")
+	return isProject || isPoetry
 }
 
 func fileExists(path string) bool {
@@ -79,7 +93,7 @@ func fileExists(path string) bool {
 // unrelated reason (e.g. a test file exercising a real server elsewhere in
 // the same directory).
 func classifyPythonScriptProject(p *Project) (Role, []string) {
-	data, err := os.ReadFile(p.ManifestPath)
+	data, err := readFileCapped(p.ManifestPath)
 	if err != nil {
 		return RoleUnrelated, nil
 	}

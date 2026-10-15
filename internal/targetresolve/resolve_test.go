@@ -582,3 +582,54 @@ new McpServer();
 		t.Errorf("expected test-dependent reason for the test sibling, got %v", target.IncludedReasons[testsDir])
 	}
 }
+
+// Several projects can share a directory: here a Python tool's
+// pyproject.toml sits beside the package.json of the library the server
+// depends on. The server's file: dependency is on that Node package, so its
+// own dependencies stay in scope and the Python project stays out of it.
+func TestResolve_DependencyOnSharedDirectoryFollowsOwnEcosystem(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "srv", "package.json"), `{"name": "srv", "bin": "dist/index.js", "dependencies": {"@modelcontextprotocol/sdk": "^1", "liba": "file:../liba"}}`)
+	writeFile(t, filepath.Join(root, "srv", "src", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	writeFile(t, filepath.Join(root, "liba", "package.json"), `{"name": "liba", "dependencies": {"libb": "file:../libb"}}`)
+	writeFile(t, filepath.Join(root, "liba", "pyproject.toml"), "[project]\nname = \"liba-py-tools\"\n")
+	writeFile(t, filepath.Join(root, "libb", "package.json"), `{"name": "libb"}`)
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if len(resolution.Targets) != 1 {
+		t.Fatalf("targets = %v, want only srv", targetNames(resolution.Targets))
+	}
+	var included []string
+	for _, p := range resolution.Targets[0].Included {
+		included = append(included, p.Name)
+	}
+	if strings.Join(included, ",") != "srv,liba,libb" {
+		t.Errorf("srv includes %v, want srv, liba and libb", included)
+	}
+	for _, p := range resolution.Projects {
+		if p.Name == "liba-py-tools" && (p.Role != RoleUnrelated || len(p.Evidence) != 0) {
+			t.Errorf("liba-py-tools role = %v, evidence = %v; want unrelated, referenced by nothing", p.Role, p.Evidence)
+		}
+	}
+}
+
+// A manifest-less Python script owns its file, not its directory: a smoke
+// client beside a Node server's source leaves that source the server's, so
+// the server is still found.
+func TestResolve_ScriptDoesNotHideItsDirectoryFromTheEnclosingProject(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{"name": "my-mcp", "bin": {"my-mcp": "dist/index.js"}, "dependencies": {"@modelcontextprotocol/sdk": "^1"}}`)
+	writeFile(t, filepath.Join(root, "src", "index.ts"), `import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"; new McpServer();`)
+	writeFile(t, filepath.Join(root, "src", "smoke_client.py"), "from mcp.client.stdio import stdio_client\n")
+
+	resolution, err := Resolve(root)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if names := targetNames(resolution.Targets); len(names) != 1 || names[0] != "my-mcp" {
+		t.Errorf("targets = %v, want only my-mcp", names)
+	}
+}

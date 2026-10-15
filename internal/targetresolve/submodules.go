@@ -18,7 +18,7 @@ import (
 // independent nested .git tree elsewhere in the repo) -- that broader case
 // from pattern 6 is left for a follow-up.
 func detectSubmoduleWarnings(repoRoot string) []string {
-	data, err := os.ReadFile(filepath.Join(repoRoot, ".gitmodules"))
+	data, err := readFileCapped(filepath.Join(repoRoot, ".gitmodules"))
 	if err != nil {
 		return nil
 	}

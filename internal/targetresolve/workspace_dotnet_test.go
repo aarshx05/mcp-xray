@@ -28,32 +28,41 @@ func TestNewDotnetProject(t *testing.T) {
 func TestResolveDotnetLocalDeps_RepoRootSubstitution(t *testing.T) {
 	// Mirrors the real microsoft/mcp repo: a server's csproj references a
 	// shared "core" project via $(RepoRoot), the common MSBuild convention
-	// defined once in a root Directory.Build.props.
-	root := t.TempDir()
-	serverDir := filepath.Join(root, "servers", "Fabric.Mcp.Server", "src")
-	coreDir := filepath.Join(root, "core", "Fabric.Mcp.Core", "src")
+	// defined once in a root Directory.Build.props as
+	// $(MSBuildThisFileDirectory). That ends in a separator, so the usual
+	// spelling has none after $(RepoRoot); an extra one is harmless.
+	for name, include := range map[string]string{
+		"no separator":    `$(RepoRoot)core\Fabric.Mcp.Core\src\Fabric.Mcp.Core.csproj`,
+		"extra separator": `$(RepoRoot)\core\Fabric.Mcp.Core\src\Fabric.Mcp.Core.csproj`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			serverDir := filepath.Join(root, "servers", "Fabric.Mcp.Server", "src")
+			coreDir := filepath.Join(root, "core", "Fabric.Mcp.Core", "src")
 
-	writeFile(t, filepath.Join(serverDir, "Fabric.Mcp.Server.csproj"), `<Project Sdk="Microsoft.NET.Sdk">
+			writeFile(t, filepath.Join(serverDir, "Fabric.Mcp.Server.csproj"), `<Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
-    <ProjectReference Include="$(RepoRoot)\core\Fabric.Mcp.Core\src\Fabric.Mcp.Core.csproj" />
+    <ProjectReference Include="`+include+`" />
   </ItemGroup>
 </Project>`)
-	writeFile(t, filepath.Join(coreDir, "Fabric.Mcp.Core.csproj"), `<Project Sdk="Microsoft.NET.Sdk"></Project>`)
+			writeFile(t, filepath.Join(coreDir, "Fabric.Mcp.Core.csproj"), `<Project Sdk="Microsoft.NET.Sdk"></Project>`)
 
-	server, err := newDotnetProject(filepath.Join(serverDir, "Fabric.Mcp.Server.csproj"))
-	if err != nil {
-		t.Fatalf("newDotnetProject(server) error: %v", err)
-	}
-	core, err := newDotnetProject(filepath.Join(coreDir, "Fabric.Mcp.Core.csproj"))
-	if err != nil {
-		t.Fatalf("newDotnetProject(core) error: %v", err)
-	}
+			server, err := newDotnetProject(filepath.Join(serverDir, "Fabric.Mcp.Server.csproj"))
+			if err != nil {
+				t.Fatalf("newDotnetProject(server) error: %v", err)
+			}
+			core, err := newDotnetProject(filepath.Join(coreDir, "Fabric.Mcp.Core.csproj"))
+			if err != nil {
+				t.Fatalf("newDotnetProject(core) error: %v", err)
+			}
 
-	projects := []*Project{server, core}
-	resolveDotnetLocalDeps(root, projects)
+			projects := []*Project{server, core}
+			resolveDotnetLocalDeps(root, projects)
 
-	if len(server.LocalDeps) != 1 || server.LocalDeps[0] != core.Dir {
-		t.Errorf("expected server.LocalDeps == [%q], got %v", core.Dir, server.LocalDeps)
+			if len(server.LocalDeps) != 1 || server.LocalDeps[0] != core.Dir {
+				t.Errorf("expected server.LocalDeps == [%q], got %v", core.Dir, server.LocalDeps)
+			}
+		})
 	}
 }
 

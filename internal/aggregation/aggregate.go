@@ -156,45 +156,83 @@ func appendUnique(values []string, additions ...string) []string {
 // single classification used everywhere a finding's context is computed
 // (targetresolve's file ownership calls it too).
 //
-// Only two things are read from the file name itself: a conventional project
-// document (README, LICENSE.md, SECURITY.rst, ...) is "docs", but only with no
-// extension or a documentation one -- security.go and history.ts are source
-// code. Every other tag applies to the path's DIRECTORY segments alone, so
-// src/test.go, src/build.go and src/tools.go are ordinary production files.
-// When several directories are tagged, the outermost one wins:
-// vendor/x/testing/y.go is vendored code, not the project's own tests.
+// A document is "docs" wherever it is: a markup file (.md, .rst, ...) or a
+// conventional project document (README, LICENSE, SECURITY.txt, ...) with no
+// extension or a plain-text one -- security.go and history.ts are source
+// code. Otherwise the path's DIRECTORY segments decide, so src/build.go and
+// src/tools.go are ordinary production files; when several directories are
+// tagged, the outermost one wins: vendor/x/testing/y.go is vendored code,
+// not the project's own tests. A directory is tagged only by its
+// conventional lower-case name: a capitalized one (Options/Docs/,
+// Webapp/Deployment/) is a source namespace, not a docs or deployment tree.
+// Only a file in no tagged directory is then checked against the
+// languages' test-file naming conventions (foo_test.go, foo.test.ts,
+// test_foo.py, ...).
 func ContextForPath(repoRelativePath string) string {
-	normalized := strings.ToLower(filepath.ToSlash(filepath.Clean(repoRelativePath)))
-	base := path.Base(normalized)
+	normalized := filepath.ToSlash(filepath.Clean(repoRelativePath))
+	base := strings.ToLower(path.Base(normalized))
 	ext := path.Ext(base)
-	if documentationExtensions[ext] && documentationStems[strings.TrimSuffix(base, ext)] {
+	if markupExtensions[ext] || (plainDocumentExtensions[ext] && documentationStems[strings.TrimSuffix(base, ext)]) {
 		return "docs"
 	}
 
-	dir := path.Dir(normalized)
-	if dir == "." || dir == "/" {
-		return "production"
-	}
-	for _, segment := range strings.Split(strings.Trim(dir, "/"), "/") {
-		if label, ok := contextDirectoryToLabel[segment]; ok {
-			return label
+	if dir := path.Dir(normalized); dir != "." && dir != "/" {
+		for _, segment := range strings.Split(strings.Trim(dir, "/"), "/") {
+			if label, ok := contextDirectoryToLabel[segment]; ok {
+				return label
+			}
+			if isDotnetTestProject(segment) {
+				return "test"
+			}
 		}
+	}
+	if isTestFileName(base) {
+		return "test"
 	}
 	return "production"
 }
 
+// isDotnetTestProject reports whether a directory is named like a .NET test
+// project: Foo.Tests, Foo.UnitTests, Foo.IntegrationTests.
+func isDotnetTestProject(segment string) bool {
+	for _, suffix := range []string{".Tests", ".UnitTests", ".IntegrationTests"} {
+		if strings.HasSuffix(segment, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTestFileName reports whether a (lower-cased) file name follows a
+// language's test-file convention: Go's foo_test.go, JavaScript's
+// foo.test.ts and foo.spec.js, and pytest's test_foo.py, foo_test.py and
+// conftest.py.
+func isTestFileName(base string) bool {
+	switch ext := path.Ext(base); ext {
+	case ".go":
+		return strings.HasSuffix(base, "_test.go")
+	case ".py":
+		return base == "conftest.py" || strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py")
+	case ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts":
+		stem := strings.TrimSuffix(base, ext)
+		return strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec")
+	}
+	return false
+}
+
 // documentationStems are the conventional names of top-level project
-// documents; documentationExtensions are the extensions such a document
-// carries ("" for README, LICENSE, NOTICE, ...).
+// documents, which are docs with no extension (README, LICENSE, NOTICE, ...)
+// or a plain-text one; a markup file is a document whatever its name.
 var documentationStems = map[string]bool{
 	"readme": true, "changelog": true, "changes": true, "contributing": true, "contributors": true,
 	"license": true, "licence": true, "notice": true, "authors": true, "troubleshooting": true,
 	"code_of_conduct": true, "code-of-conduct": true, "security": true, "history": true,
 }
 
-var documentationExtensions = map[string]bool{
-	"": true, ".md": true, ".markdown": true, ".mdx": true, ".rst": true, ".txt": true,
-	".adoc": true, ".asciidoc": true, ".org": true, ".html": true,
+var plainDocumentExtensions = map[string]bool{"": true, ".txt": true, ".html": true, ".org": true}
+
+var markupExtensions = map[string]bool{
+	".md": true, ".markdown": true, ".mdx": true, ".rst": true, ".adoc": true, ".asciidoc": true,
 }
 
 // contextDirectoryToLabel maps a directory name to the context of everything
@@ -206,12 +244,19 @@ var contextDirectoryToLabel = map[string]string{
 	"__tests__":        "test",
 	"testing":          "test",
 	"testdata":         "test",
+	"e2e":              "test",
+	"__mocks__":        "test",
+	"mocks":            "test",
+	"benchmark":        "test",
+	"benchmarks":       "test",
+	"evals":            "test",
 	"fixture":          "fixture",
 	"fixtures":         "fixture",
 	"testfixtures":     "fixture",
 	"docs":             "docs",
 	"documentation":    "docs",
 	"doc":              "docs",
+	"docs_src":         "docs",
 	"examples":         "example",
 	"example":          "example",
 	"samples":          "example",
@@ -221,7 +266,7 @@ var contextDirectoryToLabel = map[string]string{
 	".azure-pipelines": "ci",
 	"scripts":          "build",
 	"script":           "build",
-	"tools":            "build",
+	"eng":              "build",
 	"deploy":           "deployment",
 	"deployment":       "deployment",
 	"infra":            "deployment",

@@ -9,7 +9,7 @@ import (
 func TestIsOwnershipBoundary_ValidServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), validServerJSON)
-	if !isOwnershipBoundary(dir, nil) {
+	if !isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected a valid server.json to be recognized as an ownership boundary")
 	}
 }
@@ -17,7 +17,7 @@ func TestIsOwnershipBoundary_ValidServerJSON(t *testing.T) {
 func TestIsOwnershipBoundary_UnrelatedFileNamedServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"port": 8080, "host": "localhost"}`)
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected an unrelated file merely named server.json to NOT be an ownership boundary")
 	}
 }
@@ -25,7 +25,7 @@ func TestIsOwnershipBoundary_UnrelatedFileNamedServerJSON(t *testing.T) {
 func TestIsOwnershipBoundary_BlankNameServerJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "", "packages": [{"registryType": "npm", "identifier": "x"}]}`)
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected a blank-name server.json to NOT be an ownership boundary")
 	}
 }
@@ -34,14 +34,14 @@ func TestIsOwnershipBoundary_ComponentJSONAloneIsNotABoundary(t *testing.T) {
 	// component.json is the Bower package manifest, unrelated to MCP.
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "component.json"), `{"name": "some-bower-package"}`)
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected component.json alone to NOT be an ownership boundary")
 	}
 }
 
 func TestIsOwnershipBoundary_NoFile(t *testing.T) {
 	dir := t.TempDir()
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected a directory with neither file to NOT be an ownership boundary")
 	}
 }
@@ -49,7 +49,7 @@ func TestIsOwnershipBoundary_NoFile(t *testing.T) {
 func TestIsOwnershipBoundary_MalformedJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{not valid json`)
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("expected malformed JSON to NOT be an ownership boundary")
 	}
 }
@@ -110,9 +110,9 @@ func TestAssignIdentities_ValidServerJSONStillMergesSiblingProjects(t *testing.T
 
 // Discovery walks the tree in lexical order, so a server's dependencies can
 // be discovered both before (a-lib) and after (z-lib) the server itself.
-// Every dependency must get its real stable ID: transitiveClosure trusts
-// LocalDepIDs whenever any of them resolves, so a single empty ID used to
-// drop z-lib from the target's scope while a-lib kept it looking healthy.
+// Every dependency must get its real stable ID and stay in the target's
+// scope: a single empty ID once dropped z-lib while a-lib kept the scope
+// looking healthy.
 func TestResolve_DependencyDiscoveredAfterItsDependentStaysInScope(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "package.json"), `{
@@ -151,7 +151,7 @@ func TestResolve_DependencyDiscoveredAfterItsDependentStaysInScope(t *testing.T)
 func TestIsOwnershipBoundary_RemotesOnlyManifest(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "server.json"), `{"name": "com.example/hosted", "remotes": [{"type": "streamable-http", "url": "https://example.com/mcp"}]}`)
-	if isOwnershipBoundary(dir, nil) {
+	if isOwnershipBoundary(dir, dir, nil) {
 		t.Error("a remotes-only server.json must not be an ownership boundary")
 	}
 }

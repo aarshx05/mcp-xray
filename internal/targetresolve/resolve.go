@@ -38,7 +38,7 @@ func Resolve(repoRoot string) (*Resolution, error) {
 
 	resolveGoLocalDeps(projects)
 	resolveNodeLocalDeps(projects)
-	resolvePythonLocalDeps(projects)
+	resolvePythonLocalDeps(absRoot, projects)
 	resolveDotnetLocalDeps(absRoot, projects)
 	resolveJavaLocalDeps(projects)
 	resolveRustLocalDeps(absRoot, projects)

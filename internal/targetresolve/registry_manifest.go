@@ -1,11 +1,13 @@
 package targetresolve
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+
+	"mcpxray/internal/aggregation"
 )
 
 // registryManifestHit is one directory confirmed, via a valid server.json,
@@ -53,6 +55,16 @@ func (pkg registryPackage) publishedBy(p *Project) bool {
 	return false
 }
 
+// names reports whether p publishes a package the manifest names.
+func (hit registryManifestHit) names(p *Project) bool {
+	for _, pkg := range hit.Packages {
+		if pkg.publishedBy(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // publishingProject returns the one non-test project at or below the
 // manifest's directory that publishes a package the manifest names, or nil
 // when none or several do. A server.json at a monorepo's root typically
@@ -60,33 +72,82 @@ func (pkg registryPackage) publishedBy(p *Project) bool {
 func (hit registryManifestHit) publishingProject(projects []*Project) *Project {
 	var found *Project
 	for _, p := range projects {
-		if !within(p.Dir, hit.Dir) || isTestShapedProject(p) {
+		if !within(p.Dir, hit.Dir) || isTestShapedProject(p) || !hit.names(p) {
 			continue
 		}
-		for _, pkg := range hit.Packages {
-			if pkg.publishedBy(p) {
-				if found != nil && found != p {
-					return nil
-				}
-				found = p
-			}
+		if found != nil && found != p {
+			return nil
 		}
+		found = p
 	}
 	return found
 }
 
+// subject returns the project the manifest describes, in order of
+// preference: the one project that publishes a package it names; the
+// server, or else the only project, in its own directory (several can share
+// it, a package.json beside a pyproject.toml); its one non-test descendant
+// (server.json may sit directories above the manifest it describes, as in
+// servers/Foo/server.json for servers/Foo/src/Foo.csproj).
+//
+// ok is false when the manifest cannot be tied to one project: its own
+// directory holds several and not exactly one server, or, with no server
+// there, its packages are built from code below it that holds several
+// independent servers -- a root server.json naming a container image in a
+// repository of servers describes one of them, but nothing says which, so
+// it neither confirms nor owns any. (A remotes-only manifest describes a
+// hosted server, not code below it.) A nil project with ok true means there
+// is no project at or below the manifest at all: its server is in a
+// language without a manifest parser.
+func (hit registryManifestHit) subject(projects []*Project) (*Project, bool) {
+	if named := hit.publishingProject(projects); named != nil {
+		return named, true
+	}
+	var own, ownServers, descendants []*Project
+	serverDirs := make(map[string]bool)
+	for _, p := range projects {
+		dir := filepath.Clean(p.Dir)
+		if !within(dir, hit.Dir) || isTestShapedProject(p) {
+			continue
+		}
+		if dir == hit.Dir {
+			own = append(own, p)
+			if p.Role == RoleMCPServer {
+				ownServers = append(ownServers, p)
+			}
+			continue
+		}
+		descendants = append(descendants, p)
+		if p.Role == RoleMCPServer {
+			serverDirs[dir] = true
+		}
+	}
+	switch {
+	case len(ownServers) == 1:
+		return ownServers[0], true
+	case len(ownServers) > 1, len(own) > 1, hit.HasLocalPackages && len(serverDirs) > 1:
+		return nil, false
+	case len(own) == 1:
+		return own[0], true
+	case len(descendants) == 1:
+		return descendants[0], true
+	}
+	return nil, true
+}
+
 // isOwnershipBoundary reports whether a server.json in dir makes dir the
 // ownership root of the projects below it: dir must hold a valid registry
-// manifest of a locally built server (it has packages) that does not name
-// a package published from another directory, since such a manifest
-// describes that one project rather than everything below it.
-func isOwnershipBoundary(dir string, projects []*Project) bool {
-	hit, ok := readRegistryManifest(filepath.Join(dir, "server.json"))
+// manifest of a locally built server (it has packages) that can be tied to
+// its subject, and that subject must not be a project publishing a package
+// it names from another directory, since such a manifest describes that one
+// project rather than everything below it.
+func isOwnershipBoundary(repoRoot, dir string, projects []*Project) bool {
+	hit, ok := readRegistryManifest(repoRoot, filepath.Join(dir, "server.json"))
 	if !ok || !hit.HasLocalPackages {
 		return false
 	}
-	described := hit.publishingProject(projects)
-	return described == nil || filepath.Clean(described.Dir) == filepath.Clean(dir)
+	described, ok := hit.subject(projects)
+	return ok && (described == nil || filepath.Clean(described.Dir) == hit.Dir || !hit.names(described))
 }
 
 // isValidRegistryManifest applies a minimal structural check for the
@@ -132,7 +193,7 @@ func discoverRegistryManifests(repoRoot string) ([]registryManifestHit, error) {
 		if strings.ToLower(info.Name()) != "server.json" {
 			return nil
 		}
-		if hit, ok := readRegistryManifest(path); ok {
+		if hit, ok := readRegistryManifest(repoRoot, path); ok {
 			hits = append(hits, hit)
 		}
 		return nil
@@ -144,16 +205,16 @@ func discoverRegistryManifests(repoRoot string) ([]registryManifestHit, error) {
 }
 
 // readRegistryManifest parses the server.json at path, reporting false when
-// it is not a valid MCP registry manifest. A file merely named server.json
-// is not one (isValidRegistryManifest).
-func readRegistryManifest(path string) (registryManifestHit, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+// it is not a valid MCP registry manifest -- a file merely named server.json
+// is not one (isValidRegistryManifest) -- or when it is a sample
+// (isSampleManifestPath).
+func readRegistryManifest(repoRoot, path string) (registryManifestHit, bool) {
+	if isSampleManifestPath(repoRelative(repoRoot, path)) {
 		return registryManifestHit{}, false
 	}
 	dir := filepath.Dir(path)
 	var doc map[string]interface{}
-	if err := json.Unmarshal(data, &doc); err != nil || !isValidRegistryManifest(doc) {
+	if err := readJSONFile(path, &doc); err != nil || !isValidRegistryManifest(doc) {
 		return registryManifestHit{}, false
 	}
 	name, confirmed := registryManifestDisplayName(doc, dir)
@@ -174,51 +235,39 @@ func readRegistryManifest(path string) (registryManifestHit, bool) {
 // applyRegistryManifestSignals applies the authoritative, language-agnostic
 // signal: a directory with a valid server.json describes an MCP server,
 // whatever the source heuristics in signals.go concluded. The manifest
-// describes, in order of preference: the one project that publishes a
-// package it names; the project in its own directory; its one non-test
-// descendant project (server.json may sit directories above the manifest
-// it describes, as in servers/Foo/server.json for
-// servers/Foo/src/Foo.csproj). With none of those, a minimal Project is
-// synthesized, so a server in a language without a manifest parser is
-// still found. Ambiguity never upgrades a project: a server's own test
-// project must never take its server.json.
+// describes its subject; with no project at or below it at all, a minimal
+// Project is synthesized, so a server in a language without a manifest
+// parser is still found. Ambiguity never upgrades a project: a server's own
+// test project must never take its server.json, and a manifest that cannot
+// say which of several projects it describes is left out.
 func applyRegistryManifestSignals(repoRoot string, projects []*Project) ([]*Project, error) {
 	hits, err := discoverRegistryManifests(repoRoot)
 	if err != nil {
 		return projects, err
 	}
-	byDir := make(map[string]*Project, len(projects))
-	for _, p := range projects {
-		byDir[filepath.Clean(p.Dir)] = p
-	}
 
 	for _, hit := range hits {
-		if named := hit.publishingProject(projects); named != nil {
-			note := ""
-			if filepath.Clean(named.Dir) != hit.Dir {
-				note = fmt.Sprintf(" (server.json at %s names this package)", repoRelative(repoRoot, hit.Dir))
+		described, ok := hit.subject(projects)
+		if !ok {
+			continue
+		}
+		switch {
+		case described == nil:
+			synthesized := &Project{
+				Name:      hit.Name,
+				Dir:       hit.Dir,
+				RelDir:    repoRelative(repoRoot, hit.Dir),
+				Ecosystem: "unknown",
 			}
-			hit.describe(named, note)
-			continue
+			hit.describe(synthesized, "; no recognized ecosystem manifest found in this directory")
+			projects = append(projects, synthesized)
+		case filepath.Clean(described.Dir) == hit.Dir:
+			hit.describe(described, "")
+		case hit.names(described):
+			hit.describe(described, fmt.Sprintf(" (server.json at %s names this package)", repoRelative(repoRoot, hit.Dir)))
+		default:
+			hit.describe(described, " (server.json found in an ancestor directory)")
 		}
-		if existing, ok := byDir[hit.Dir]; ok {
-			hit.describe(existing, "")
-			continue
-		}
-		if candidate := findUnambiguousDescendantProject(hit.Dir, projects); candidate != nil {
-			hit.describe(candidate, " (server.json found in an ancestor directory)")
-			continue
-		}
-
-		synthesized := &Project{
-			Name:      hit.Name,
-			Dir:       hit.Dir,
-			RelDir:    repoRelative(repoRoot, hit.Dir),
-			Ecosystem: "unknown",
-		}
-		hit.describe(synthesized, "; no recognized ecosystem manifest found in this directory")
-		projects = append(projects, synthesized)
-		byDir[hit.Dir] = synthesized
 	}
 
 	return projects, nil
@@ -245,22 +294,16 @@ func (hit registryManifestHit) describe(p *Project, note string) {
 	}
 }
 
-// findUnambiguousDescendantProject returns the single project strictly below
-// hitDir that is not test-shaped, or nil when there are none or several.
-func findUnambiguousDescendantProject(hitDir string, projects []*Project) *Project {
-	var candidate *Project
-	for _, p := range projects {
-		pDir := filepath.Clean(p.Dir)
-		if pDir == hitDir || !strings.HasPrefix(pDir, hitDir+string(filepath.Separator)) {
-			continue
-		}
-		if isTestShapedProject(p) {
-			continue
-		}
-		if candidate != nil {
-			return nil // ambiguous: more than one non-test-shaped descendant
-		}
-		candidate = p
+// isSampleManifestPath reports whether the server.json at the
+// repository-relative relPath is a sample rather than the description of a
+// server in this repository: it sits among tests, fixtures, documentation or
+// examples (aggregation.ContextForPath), or in a test-shaped directory, the
+// rule that keeps a project there from ever being a server
+// (isTestShapedProject).
+func isSampleManifestPath(relPath string) bool {
+	switch aggregation.ContextForPath(relPath) {
+	case "test", "fixture", "docs", "example":
+		return true
 	}
-	return candidate
+	return isTestShapedDir(path.Dir(relPath))
 }

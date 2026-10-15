@@ -2,7 +2,6 @@ package targetresolve
 
 import (
 	"encoding/xml"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -29,7 +28,7 @@ type pomDependency struct {
 
 // readPom centralizes the read+parse boilerplate, mirroring readCsproj.
 func readPom(manifestPath string) (*pomXML, error) {
-	data, err := os.ReadFile(manifestPath)
+	data, err := readFileCapped(manifestPath)
 	if err != nil {
 		return nil, err
 	}

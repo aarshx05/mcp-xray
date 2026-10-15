@@ -1,12 +1,13 @@
 package targetresolve
 
 import (
-	"encoding/json"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"mcpxray/internal/aggregation"
 )
 
 // nodeSDKPackages are the official TypeScript SDK's packages: the original
@@ -38,14 +39,17 @@ var (
 	goServerPattern = regexp.MustCompile(`mcp\.NewServer\(`)
 	goClientPattern = regexp.MustCompile(`mcp\.NewClient\(`)
 
-	// Node: a construction call, or any quoted import/require specifier
-	// naming the SDK's server (resp. client) module however the imported
-	// symbol is then used -- `class RushMCPServer extends McpServer` never
-	// calls `new McpServer(...)`. The module is @modelcontextprotocol/sdk's
-	// server sub-path or SDK v2's @modelcontextprotocol/server package (never
-	// a reference server such as @modelcontextprotocol/server-everything).
-	nodeServerPattern = regexp.MustCompile(`new\s+(McpServer|Server)\s*\(|["']@modelcontextprotocol/(?:sdk/)?server(?:/[^"']*)?["']`)
-	nodeClientPattern = regexp.MustCompile(`new\s+Client\s*\(|["']@modelcontextprotocol/(?:sdk/)?client(?:/[^"']*)?["']`)
+	// Node: a construction call, or an import of the SDK's server (resp.
+	// client) module however the imported symbol is then used -- `class
+	// RushMCPServer extends McpServer` never calls `new McpServer(...)`. The
+	// module is @modelcontextprotocol/sdk's server sub-path or SDK v2's
+	// @modelcontextprotocol/server package (never a reference server such as
+	// @modelcontextprotocol/server-everything), and it counts only as the
+	// specifier of an `import ... from`, `export ... from`, `import(...)` or
+	// `require(...)`: a script that merely lists the package name in a string
+	// does not use it.
+	nodeServerPattern = regexp.MustCompile(`new\s+(McpServer|Server)\s*\(|` + nodeModuleSpecifier(`@modelcontextprotocol/(?:sdk/)?server(?:/[^"'\x60]*)?`))
+	nodeClientPattern = regexp.MustCompile(`new\s+Client\s*\(|` + nodeModuleSpecifier(`@modelcontextprotocol/(?:sdk/)?client(?:/[^"'\x60]*)?`))
 
 	// Python: the sub-signals are also used on their own by
 	// classifyPythonScriptProject for manifest-less scripts.
@@ -86,14 +90,23 @@ var (
 	javaClientPattern                = regexp.MustCompile(javaClientNamespaceImportPattern.String() + `|` + javaClientConstructionPattern.String())
 
 	// Rust: rmcp servers implement the ServerHandler trait (clients,
-	// ClientHandler). The alternatives cover a grouped use
-	// (`use rmcp::{..., handler::server::ServerHandler};`), a flat qualified
-	// path, and the impl block itself, bare or path-qualified
-	// (`impl mcp::ServerHandler for`, when the crate is renamed in
-	// Cargo.toml).
-	rustServerPattern = regexp.MustCompile(`\brmcp::\{[^}]*\bServerHandler\b|\brmcp::(?:\w+::)*ServerHandler\b|\bimpl\s+(?:\w+::)*ServerHandler\s+for\b`)
-	rustClientPattern = regexp.MustCompile(`\brmcp::\{[^}]*\bClientHandler\b|\brmcp::(?:\w+::)*ClientHandler\b|\bimpl\s+(?:\w+::)*ClientHandler\s+for\b`)
+	// ClientHandler) or have #[tool_router(server_handler)] generate the impl,
+	// and import from rmcp's handler::server module (resp. handler::client).
+	// The alternatives cover a grouped use (`use rmcp::{..., ServerHandler};`,
+	// `use rmcp::{handler::server::wrapper::Parameters, ...};`), a flat
+	// qualified path, the impl block itself, bare or path-qualified (`impl
+	// mcp::ServerHandler for`, when the crate is renamed in Cargo.toml), and
+	// the macro attribute.
+	rustServerPattern = regexp.MustCompile(`\brmcp::\{[^}]*\b(?:ServerHandler|handler::server)\b|\brmcp::(?:\w+::)*ServerHandler\b|\brmcp::handler::server\b|\bimpl\s+(?:\w+::)*ServerHandler\s+for\b|#\[tool_router\s*\(\s*server_handler\b`)
+	rustClientPattern = regexp.MustCompile(`\brmcp::\{[^}]*\b(?:ClientHandler|handler::client)\b|\brmcp::(?:\w+::)*ClientHandler\b|\brmcp::handler::client\b|\bimpl\s+(?:\w+::)*ClientHandler\s+for\b`)
 )
+
+// nodeModuleSpecifier matches module, quoted, as the specifier of an import:
+// `from "m"` (import and re-export), `import "m"`, `import("m")` and
+// `require("m")`.
+func nodeModuleSpecifier(module string) string {
+	return `(?:\bfrom|\bimport\s*\(?|\brequire\s*\()\s*["'\x60]` + module + `["'\x60]`
+}
 
 // Patterns used only to classify a manifest-less Python script
 // (discover_python_script.go): pythonMainGuardPattern and
@@ -119,21 +132,44 @@ var ecosystemSourceExtensions = map[string][]string{
 	"rust":   {".rs"},
 }
 
-// wrapperEntrypointPatterns are per-ecosystem "this file starts something
-// up" signals: a constructed server being run, served or connected, as
-// opposed to merely imported. hasOwnEntrypointEvidence uses them to
+// wrapperEntrypointPatterns are per-ecosystem "this program starts a
+// server" signals, each pattern of which must match one of a project's own
+// (non-test) source files: a program running, serving or connecting a
+// server, as opposed to a library that merely builds one, or any method
+// that happens to be called Run. hasOwnEntrypointEvidence uses them to
 // recognize a thin wrapper entrypoint whose server construction lives in a
-// workspace-local dependency. Java and Rust use the language's own
-// entrypoint marker (static void main, fn main) because their SDKs have no
-// single startup call to look for.
-var wrapperEntrypointPatterns = map[string]*regexp.Regexp{
-	"go":     regexp.MustCompile(`\.Run\s*\(`),
-	"node":   regexp.MustCompile(`\.connect\s*\(|\.listen\s*\(|\bserveStdio\s*\(|\bserve\s*\(\s*\{`),
-	"python": regexp.MustCompile(`\.run\s*\(|\.serve\s*\(`),
-	"dotnet": regexp.MustCompile(`\.Run\s*\(\)|\.RunAsync\s*\(`),
-	"java":   regexp.MustCompile(`\bpublic\s+static\s+void\s+main\s*\(`),
-	"rust":   regexp.MustCompile(`\bfn\s+main\s*\(`),
+// workspace-local dependency, and isLaunchable to tell such a program from
+// a library.
+//
+//   - Go: a main function in package main, and a server run or served by
+//     it: the SDK's Server.Run(ctx, transport), mcp-go's ServeStdio, or
+//     net/http's ListenAndServe -- never t.Run or exec.Cmd.Run.
+//   - Node: nodeEntrypointPattern.
+//   - Python: run or serve called on a server, MCP or app object, or the
+//     asyncio/anyio/trio/uvicorn call that starts one -- never
+//     subprocess.run or an agent's run.
+//   - .NET: running the host or web application -- never Task.Run or a
+//     command handler's RunAsync.
+//   - Java and Rust: the language's own entrypoint marker (static void
+//     main, fn main), because their SDKs have no single startup call to
+//     look for.
+var wrapperEntrypointPatterns = map[string][]*regexp.Regexp{
+	"go": {
+		regexp.MustCompile(`(?ms)^package\s+main\b.*^func\s+main\s*\(\s*\)`),
+		regexp.MustCompile(`\.Run\s*\(\s*(?:ctx|context\.\w+\(\s*\))\s*,|\bServeStdio\s*\(|\bListenAndServe(?:TLS)?\s*\(`),
+	},
+	"node":   {nodeEntrypointPattern},
+	"python": {regexp.MustCompile(`(?i)\b\w*(?:mcp|server|app)\.(?:run|serve)\s*\(|\b(?:asyncio|anyio|trio|uvicorn)\.run\s*\(`)},
+	"dotnet": {regexp.MustCompile(`(?i:\b\w*(?:app|host))\s*\.\s*Run(?:Async)?\s*\(|\.Build\s*\(\s*\)\s*\.\s*Run(?:Async)?\s*\(`)},
+	"java":   {regexp.MustCompile(`\bpublic\s+static\s+void\s+main\s*\(`)},
+	"rust":   {regexp.MustCompile(`\bfn\s+main\s*\(`)},
 }
+
+// nodeEntrypointPattern is Node's startup call: a server connected to a
+// transport, an HTTP server listening on a port, or a serve() call (Hono's
+// Node adapter, serveStdio) -- never db.connect() or a mock server's
+// listen({ onUnhandledRequest }).
+var nodeEntrypointPattern = regexp.MustCompile(`\.connect\s*\(\s*(?:new\s+\w*Transport\b|[\w$.]*[tT]ransport\b)|\.listen\s*\(\s*(?:\d|[^,)]*(?i:port))|\bserveStdio\s*\(|\bserve\s*\(\s*\{`)
 
 // classifyRoles assigns an initial Role to every project, independently of
 // the dependency graph (shared-library promotion happens afterward, in
@@ -231,13 +267,16 @@ var (
 // directory basename is checked, the one part of an absolute path that is
 // always the project's own.
 func isTestShapedProject(p *Project) bool {
-	switch p.RelDir {
-	case "":
+	if p.RelDir == "" {
 		return testShapedNameSuffixPattern.MatchString(filepath.Base(p.Dir))
-	case ".":
-		return false
 	}
-	return testShapedPathSegmentPattern.MatchString(p.RelDir) || testShapedNameSuffixPattern.MatchString(path.Base(p.RelDir))
+	return isTestShapedDir(p.RelDir)
+}
+
+// isTestShapedDir applies isTestShapedProject's rule to a repository-relative
+// directory in POSIX form.
+func isTestShapedDir(relDir string) bool {
+	return relDir != "." && (testShapedPathSegmentPattern.MatchString(relDir) || testShapedNameSuffixPattern.MatchString(path.Base(relDir)))
 }
 
 // classifyTestShapedProject still runs the normal ecosystem classification
@@ -366,12 +405,8 @@ func hasConsumerConfig(p *Project) bool {
 		if name != "mcp.json" && name != "mcp_config.json" && !strings.Contains(name, "claude_desktop_config") {
 			return nil
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
 		var doc map[string]interface{}
-		if json.Unmarshal(data, &doc) != nil {
+		if readJSONFile(path, &doc) != nil {
 			return nil
 		}
 		if _, ok := doc["mcpServers"]; ok {
@@ -383,36 +418,30 @@ func hasConsumerConfig(p *Project) bool {
 	return found
 }
 
-// pythonSDKDependency reports whether the pyproject.toml document depends on
-// the official "mcp" package or "fastmcp", checking both Poetry-style
-// dependency tables (exact key match) and PEP 621's [project].dependencies
-// array of PEP 508 specifier strings.
-func pythonSDKDependency(doc map[string]interface{}) (string, bool) {
-	sdkNames := map[string]bool{"mcp": true, "fastmcp": true}
+// pythonSDKPackages are the Python MCP SDK distributions, in the order
+// pythonSDKDependency prefers them: a project declaring both is reported as
+// depending on the official "mcp" package on every run, whatever order its
+// TOML tables come in.
+var pythonSDKPackages = []string{"mcp", "fastmcp"}
 
+// pythonSDKDependency names the Python MCP SDK the pyproject.toml document
+// depends on: among the dependencies the project runs with
+// (pythonRuntimeDependencies: PEP 621's [project].dependencies and
+// optional-dependencies, Poetry's main table) or a Poetry dependency group.
+// An SDK declared only as an extra ("pip install mytool[mcp]") is still
+// what the project's server code is written against.
+func pythonSDKDependency(doc map[string]interface{}) (string, bool) {
+	declared := pythonRuntimeDependencies(doc)
 	for _, deps := range poetryDependencyTables(doc) {
 		for name := range deps {
-			if sdkNames[strings.ToLower(name)] {
-				return name, true
-			}
+			declared[normalizePEP503(name)] = true
 		}
 	}
-
-	if depsVal, ok := valueAt(doc, "project", "dependencies"); ok {
-		if arr, ok := depsVal.([]interface{}); ok {
-			for _, item := range arr {
-				spec, ok := item.(string)
-				if !ok {
-					continue
-				}
-				name := pep508PackageName(spec)
-				if sdkNames[strings.ToLower(name)] {
-					return name, true
-				}
-			}
+	for _, sdk := range pythonSDKPackages {
+		if declared[sdk] {
+			return sdk, true
 		}
 	}
-
 	return "", false
 }
 
@@ -431,13 +460,16 @@ func pep508PackageName(spec string) string {
 
 // projectSourceSignals reports which of the named patterns match a file
 // under project.Dir whose name ends with one of extensions. It never
-// descends into another project nested in that tree, so a nested project's
-// code cannot change this project's role.
+// descends into another project nested in that tree (one that
+// ownsDirectory), so a nested project's code cannot change this project's
+// role, and it skips the project's tests and fixtures (src/test/, tests/,
+// foo_test.go, foo.test.ts, ...): a library whose tests start a server is
+// not a server.
 func projectSourceSignals(project *Project, allProjects []*Project, extensions []string, patterns map[string]*regexp.Regexp) map[string]bool {
 	projDir := filepath.Clean(project.Dir)
 	nestedProjectDirs := make(map[string]bool)
 	for _, other := range allProjects {
-		if otherDir := filepath.Clean(other.Dir); otherDir != projDir && within(otherDir, projDir) {
+		if otherDir := filepath.Clean(other.Dir); otherDir != projDir && within(otherDir, projDir) && ownsDirectory(other) {
 			nestedProjectDirs[otherDir] = true
 		}
 	}
@@ -445,10 +477,10 @@ func projectSourceSignals(project *Project, allProjects []*Project, extensions [
 
 	found := make(map[string]bool, len(patterns))
 	_ = walkFiles(project.Dir, isNestedProject, func(path string, info os.FileInfo) error {
-		if !hasAnyExt(info.Name(), extensions) {
+		if !hasAnyExt(info.Name(), extensions) || isTestSource(projDir, path) {
 			return nil
 		}
-		content, err := os.ReadFile(path)
+		content, err := readFileCapped(path)
 		if err != nil {
 			return nil
 		}
@@ -463,6 +495,25 @@ func projectSourceSignals(project *Project, allProjects []*Project, extensions [
 		return nil
 	})
 	return found
+}
+
+// ownsDirectory reports whether p owns the directory it was found in, and
+// so bounds the source of a project enclosing it. A manifest-less Python
+// script owns only its own file: the files beside it still belong to the
+// project around them, as a Node server's src/ holding a Python smoke-test
+// client is still the server's source.
+func ownsDirectory(p *Project) bool {
+	return p.Ecosystem != "python-script"
+}
+
+// isTestSource reports whether path is one of the project's tests or
+// fixtures, judged by its path below the project directory.
+func isTestSource(projDir, path string) bool {
+	switch aggregation.ContextForPath(repoRelative(projDir, path)) {
+	case "test", "fixture":
+		return true
+	}
+	return false
 }
 
 func hasAnyExt(name string, exts []string) bool {
