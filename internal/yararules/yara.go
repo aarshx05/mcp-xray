@@ -1,11 +1,9 @@
 package yararules
 
 import (
+	_ "embed"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -75,19 +73,16 @@ var (
 	unsafeSystemPatternsOnce sync.Once
 )
 
-// loadUnsafeSystemPatterns loads patterns from the YARA file
+// unsafePatternsYara is compiled into the binary: reading it from the source
+// directory at run time made every SAST scan panic once the binary was run
+// anywhere its source tree no longer exists.
+//
+//go:embed unsafe_patterns.yar
+var unsafePatternsYara string
+
+// loadUnsafeSystemPatterns parses the embedded YARA rules.
 func loadUnsafeSystemPatterns() {
-	// Get the directory of this file
-	_, filename, _, _ := runtime.Caller(0)
-	dir := filepath.Dir(filename)
-	yaraFile := filepath.Join(dir, "unsafe_patterns.yar")
-
-	data, err := os.ReadFile(yaraFile)
-	if err != nil {
-		panic(fmt.Sprintf("failed to load YARA patterns file: %v", err))
-	}
-
-	patterns, err := parseYaraFile(string(data))
+	patterns, err := parseYaraFile(unsafePatternsYara)
 	if err != nil {
 		panic(fmt.Sprintf("failed to parse YARA patterns file: %v", err))
 	}
